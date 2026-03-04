@@ -1,5 +1,5 @@
-import requests
 import pandas as pd
+from data_sources.http_client import fetch_json
 
 BASE_URL = "https://openholidaysapi.org/PublicHolidays"
 
@@ -49,9 +49,12 @@ def fetch_holidays(country: str, start_date: str, end_date: str) -> pd.DataFrame
         "validFrom": start_date,
         "validTo": end_date,
     }
-    r = requests.get(BASE_URL, params=params, headers={"accept": "application/json"}, timeout=20)
-    r.raise_for_status()
-    data = r.json()
+    data = fetch_json(
+        BASE_URL,
+        params=params,
+        headers={"accept": "application/json"},
+        timeout=20,
+    )
 
     rows = []
     for h in data:

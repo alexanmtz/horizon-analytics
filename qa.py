@@ -7,29 +7,6 @@ def answer_question(df, mapping, question: str) -> str:
     q = (question or "").lower()
     derived = add_derived_columns(df, mapping)
 
-    if ("top" in q) and ("delay" in q) and ("holiday" in q):
-        if "is_bank_holiday" not in df.columns:
-            return "Holiday enrichment not connected yet. Click 🔌 Connect Holiday Calendar."
-
-        if "delay_hours" not in derived.columns:
-            return "Delay metrics not available."
-
-        top = derived.sort_values("delay_hours", ascending=False).head(10)
-
-        cols = [
-            mapping.get("id"),
-            "country",
-            "delay_hours",
-            "holiday_name",
-            mapping.get("expected_arrival_at"),
-        ]
-        cols = [c for c in cols if c and c in top.columns]
-        return format_table(top, cols)
-    q = (question or "").lower()
-
-    # Always recompute derived metrics
-    derived = add_derived_columns(df, mapping)
-
     # 1️⃣ Basic metrics fallback
     if re.search(r"\b(average|mean|median|p90|delay|transfer)\b", q):
         return compute_all_metrics(df, mapping)
@@ -37,7 +14,7 @@ def answer_question(df, mapping, question: str) -> str:
     # 2️⃣ Holiday comparison
     if "holiday" in q and "average" in q:
         if "is_bank_holiday" not in df.columns:
-            return "Holiday enrichment not connected yet. Click 🔌 Connect Holiday Calendar."
+            return "Holiday enrichment is not connected yet. Ask me to suggest an external calendar datasource."
 
         if "delay_hours" not in derived.columns:
             return "Delay metrics not available."
@@ -62,7 +39,7 @@ def answer_question(df, mapping, question: str) -> str:
     # 3️⃣ Show top delays with holiday names
     if "top" in q and "holiday" in q:
         if "is_bank_holiday" not in df.columns:
-            return "Holiday enrichment not connected yet. Click 🔌 Connect Holiday Calendar."
+            return "Holiday enrichment is not connected yet. Ask me to suggest an external calendar datasource."
 
         top = derived.sort_values("delay_hours", ascending=False).head(10)
 
@@ -80,21 +57,7 @@ def answer_question(df, mapping, question: str) -> str:
 
     # 4️⃣ Why question (smart explanation)
     if "why" in q or "explain" in q:
-        if "is_bank_holiday" not in df.columns:
-            return (
-                "Delays appear structured around calendar patterns.\n\n"
-                "This suggests bank holidays or non-business days.\n"
-                "Click 🔌 Connect Holiday Calendar to verify."
-            )
-
-        holiday_share = df["is_bank_holiday"].mean() * 100
-
-        return (
-            "🧠 Explanation\n\n"
-            f"{holiday_share:.1f}% of payouts fall on bank holidays.\n"
-            "Delays are significantly higher on those days.\n\n"
-            "Settlement is pushed to the next business day."
-        )
+        return _reason_discovery_summary(derived, mapping)
 
     # Fallback
     return compute_all_metrics(df, mapping)
@@ -115,3 +78,59 @@ def format_table(df: pd.DataFrame, cols: list[str], max_rows: int = 10) -> str:
         rows.append("| " + " | ".join([str(r[c]) for c in view.columns]) + " |")
 
     return "\n".join([header, sep] + rows)
+
+
+def _reason_discovery_summary(derived: pd.DataFrame, mapping: dict) -> str:
+    if "delay_hours" not in derived.columns or derived["delay_hours"].notna().sum() == 0:
+        return "I can't explain delay drivers yet because delay metrics are unavailable. Check timestamp mapping first."
+
+    delay = derived["delay_hours"].dropna()
+    baseline = delay.mean()
+    findings = []
+
+    candidate_dims = [
+        "country",
+        "bank",
+        "bank_name",
+        "provider",
+        mapping.get("currency"),
+        mapping.get("status"),
+    ]
+    candidate_dims = [c for c in candidate_dims if c and c in derived.columns]
+
+    strongest_dim = None
+    strongest_effect = 0.0
+
+    for dim in candidate_dims:
+        grp = derived.dropna(subset=[dim, "delay_hours"]).groupby(dim)["delay_hours"].agg(["mean", "count"])
+        grp = grp[grp["count"] >= 5]
+        if grp.empty:
+            continue
+
+        span = float(grp["mean"].max() - grp["mean"].min())
+        if span > strongest_effect:
+            strongest_effect = span
+            strongest_dim = dim
+
+    if strongest_dim is not None:
+        grp = derived.dropna(subset=[strongest_dim, "delay_hours"]).groupby(strongest_dim)["delay_hours"].agg(["mean", "count"])
+        grp = grp[grp["count"] >= 5].sort_values("mean", ascending=False)
+        top_label = str(grp.index[0])
+        top_mean = float(grp.iloc[0]["mean"])
+        findings.append(f"Largest internal driver appears to be `{strongest_dim}` (top segment `{top_label}` avg `{top_mean:.2f}h`).")
+
+    if "arrival_weekday" in derived.columns:
+        w = derived.dropna(subset=["arrival_weekday", "delay_hours"]).groupby("arrival_weekday")["delay_hours"].mean()
+        if not w.empty:
+            peak_day = str(w.idxmax())
+            peak_mean = float(w.max())
+            findings.append(f"Delay also peaks on `{peak_day}` (`{peak_mean:.2f}h` average).")
+
+    residual_hint = strongest_effect < max(2.0, baseline * 0.25)
+    if residual_hint:
+        findings.append("Internal columns only weakly explain delay variance; external calendar or operations context may help.")
+
+    if not findings:
+        return "I checked internal segments but found no strong delay drivers yet."
+
+    return "🧠 Explanation\n\n- " + "\n- ".join(findings)

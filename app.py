@@ -1,23 +1,21 @@
 import asyncio
-import os
 import traceback
 from dotenv import load_dotenv
 import chainlit as cl
 
-from helpers import followup_profile
+from helpers.followup_profile import followup_profile
 from helpers.ai_brief_from_metrics import ai_brief_from_metrics
 from helpers.ai_followups import suggest_followups
 from helpers.anomaly import ai_explain_anomaly, detect_biggest_anomaly
-from ingest import load_table
+from ingest import load_table, load_table_from_text
 from profiling import profile_df
 from semantic import suggest_mapping, apply_mapping_override
 from metrics import compute_all_metrics
 from qa import answer_question
-import pandas as pd
 
-from data_sources.holiday.holidays_client import fetch_holidays
-from data_sources.holiday.enrich_holidays import enrich_with_holidays
+from data_sources.enrichment_engine import connect_datasource
 from helpers.ensure_derived import ensure_derived
+from helpers.enrichment_recommender import recommend_enrichment
 
 load_dotenv()
 
@@ -26,16 +24,20 @@ load_dotenv()
 async def on_chat_start():
     cl.user_session.set("df", None)
     cl.user_session.set("mapping", {})
-    await cl.Message(content="Upload a CSV/XLSX to begin.").send()
+    await cl.Message(content="Upload a CSV/XLSX to begin or paste the data here.").send()
 
 
 @cl.on_message
 async def on_message(msg: cl.Message):
+    text = (msg.content or "").strip()
+    loaded_df = None
+    loaded_mapping = None
+
     # 1) File upload
     if msg.elements:
         file_el = next((e for e in msg.elements if hasattr(e, "path")), None)
         if not file_el:
-            await cl.Message(content="No file detected. Upload CSV/XLSX.").send()
+            await cl.Message(content="No file detected or data pasted. Upload CSV/XLSX or paste the data here.").send()
             return
 
         async with cl.Step(name="Process upload") as step:
@@ -48,31 +50,60 @@ async def on_message(msg: cl.Message):
             cl.user_session.set("mapping", mapping)
 
             step.output = f"Loaded {len(df)} rows and prepared mapping."
+            loaded_df = df
+            loaded_mapping = mapping
 
+
+    # 2) Pasted tabular text
+    has_dataset = cl.user_session.get("df") is not None or cl.user_session.get("df_enriched") is not None
+    if text and not has_dataset and _looks_like_tabular_text(text):
+        async with cl.Step(name="Process pasted data") as step:
+            step.output = "Reading pasted data..."
+            try:
+                df = await asyncio.to_thread(load_table_from_text, text)
+            except Exception as exc:
+                await cl.Message(
+                    content=(
+                        "I couldn't parse the pasted data. "
+                        "Please paste CSV/TSV content including a header row.\n\n"
+                        f"Details: {exc}"
+                    )
+                ).send()
+                return
+
+            cl.user_session.set("df", df)
+
+            step.output = "Inferring semantic column mapping..."
+            mapping = await asyncio.to_thread(suggest_mapping, df)
+            cl.user_session.set("mapping", mapping)
+
+            step.output = f"Loaded {len(df)} rows from pasted data and prepared mapping."
+        loaded_df = df
+        loaded_mapping = mapping
+
+    if loaded_df is not None:
         await cl.Message(
             content=(
-                f"✅ Loaded {len(df)} rows.\n\n"
-                f"Suggested mapping:\n"
-                f"- arrival_at: `{mapping.get('arrival_at')}`\n"
-                f"- expected_arrival_at: `{mapping.get('expected_arrival_at')}`\n\n"
+                f"Loaded {len(loaded_df)} rows.\n\n"
+                "Suggested mapping:\n"
+                f"- arrival_at: `{(loaded_mapping or {}).get('arrival_at')}`\n"
+                f"- expected_arrival_at: `{(loaded_mapping or {}).get('expected_arrival_at')}`\n\n"
                 "Use the button below to apply a mapping override."
             ),
             actions=[
                 cl.Action(
                     name="apply_mapping_override",
                     payload={"command": "map arrival_at=arrival_at"},
-                    label="🛠 Override Mapping",
+                    label="Override Mapping",
+                    icon="wrench",
                 ),
-                cl.Action(name="skip_mapping", payload={
-                          "action": "skip"}, label="⏭ Skip"),
-                cl.Action(name="show_profile", payload={
-                          "action": "profile"}, label="📊 View Profile"),
+                cl.Action(name="skip_mapping", payload={"action": "skip"}, label="Skip", icon="skip-forward"),
+                cl.Action(name="show_profile", payload={"action": "profile"}, label="View Profile", icon="bar-chart-3"),
             ],
         ).send()
         return
 
-    # 2) Commands
-    text = (msg.content or "").strip()
+    # 3) Commands
     if text.lower().startswith("map "):
         df = cl.user_session.get("df")
         if df is None:
@@ -85,22 +116,25 @@ async def on_message(msg: cl.Message):
 
         await cl.Message(
             content=(
-                "✅ Mapping updated.\n"
+                "Mapping updated.\n"
                 f"- arrival_at: `{new_mapping.get('arrival_at')}`\n"
                 f"- expected_arrival_at: `{new_mapping.get('expected_arrival_at')}`\n\n"
-                "Now click ✅ Confirm."
+                "Now click Confirm."
             ),
             actions=[
                 cl.Action(name="confirm_mapping", payload={
-                          "action": "confirm"}, label="✅ Confirm"),
+                              "action": "confirm"}, label="Confirm", icon="check"),
             ],
         ).send()
         return
 
-    # 3) Normal Q&A
+    # 4) Normal Q&A
     df = cl.user_session.get("df_enriched")
     if df is None:
         df = cl.user_session.get("df")
+    if df is None:
+        await cl.Message(content="Upload or paste a dataset first.").send()
+        return
 
     mapping = cl.user_session.get("mapping") or {}
 
@@ -117,6 +151,25 @@ async def on_message(msg: cl.Message):
     # Send the main answer
     await cl.Message(content=response or "DEBUG: QA returned empty").send()
 
+    suggestion = await recommend_enrichment(df, mapping, msg.content or "", response or "")
+    if suggestion:
+        await cl.Message(
+            content=(
+                "I found a potentially useful external enrichment.\n\n"
+                f"- Source: `{suggestion['source_id']}`\n"
+                f"- Why: {suggestion['reason']}\n"
+                f"- Confidence: {suggestion['confidence']:.2f}"
+            ),
+            actions=[
+                cl.Action(
+                    name="connect_datasource",
+                    payload={"source_id": suggestion["source_id"]},
+                    label=f"Connect {suggestion['source_id']}",
+                    icon="plug",
+                )
+            ],
+        ).send()
+
     # Show clickable followups
     await cl.Message(
         content="### Suggested next questions",
@@ -127,6 +180,21 @@ async def on_message(msg: cl.Message):
     ).send()
 
     return
+
+
+def _looks_like_tabular_text(text: str) -> bool:
+    lines = [ln for ln in (text or "").splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return False
+
+    delimiters = [",", "\t", ";", "|"]
+    for delim in delimiters:
+        header_count = lines[0].count(delim)
+        second_count = lines[1].count(delim)
+        if header_count > 0 and second_count == header_count:
+            return True
+
+    return False
 
 
 @cl.action_callback("show_profile")
@@ -157,13 +225,13 @@ async def apply_mapping_override_action(action: cl.Action):
 
     await cl.Message(
         content=(
-            "✅ Mapping updated.\n"
+            "Mapping updated.\n"
             f"- arrival_at: `{new_mapping.get('arrival_at')}`\n"
             f"- expected_arrival_at: `{new_mapping.get('expected_arrival_at')}`\n\n"
-            "Now click ✅ Confirm."
+            "Now click Confirm."
         ),
         actions=[
-            cl.Action(name="confirm_mapping", payload={"action": "confirm"}, label="✅ Confirm"),
+            cl.Action(name="confirm_mapping", payload={"action": "confirm"}, label="Confirm", icon="check"),
         ],
     ).send()
 
@@ -174,18 +242,18 @@ async def confirm_mapping(action: cl.Action):
     await _generate_initial_insights(
         step_name="Confirm mapping",
         completion_step_output="Mapping confirmed and insights ready.",
-        summary_prefix="✅ Mapping confirmed.",
+        summary_prefix="Mapping confirmed.",
     )
 
 
 @cl.action_callback("skip_mapping")
 async def skip_mapping(action: cl.Action):
-    await cl.Message(content="⏭ Keeping the data as is (no mapping override applied).", author="Assistant").send()
+    await cl.Message(content="Keeping the data as is (no mapping override applied).", author="Assistant").send()
 
     await _generate_initial_insights(
         step_name="Skip mapping override",
         completion_step_output="Kept mapping as-is and prepared insights.",
-        summary_prefix="⏭ Kept the data as is.",
+        summary_prefix="Kept the data as is.",
     )
 
 
@@ -237,103 +305,118 @@ async def _generate_initial_insights(
             "### Initial Insight Brief\n\n"
             f"{brief}\n\n"
             f"{metrics_text}\n\n"
-            "If you want explanations for calendar-driven delays, connect a holiday calendar:"
+            "Ask a question to explore drivers. If needed, I can suggest external enrichments."
         ),
        actions=[
-            cl.Action(name="connect_holidays", payload={"source": "openholidays"}, label="🔌 Connect Holiday Calendar"),
-            cl.Action(name="explain_anomaly", payload={"action": "explain"}, label="⚡ Explain biggest anomaly"),
+            cl.Action(name="suggest_enrichment", payload={"reason": "initial_insights"}, label="Suggest Enrichment", icon="plug"),
+            cl.Action(name="explain_anomaly", payload={"action": "explain"}, label="Explain biggest anomaly", icon="zap"),
             cl.Action(
                 name="ask_followup",
                 payload={"q": "show top delays with holiday names"},
-                label="📌 Show top delays with holiday names",
+                label="Show top delays with holiday names",
+                icon="pin",
             ),
             cl.Action(
                 name="ask_followup",
                 payload={"q": "explain holiday impact"},
-                label="🧠 Explain holiday impact",
+                label="Explain holiday impact",
+                icon="brain",
             ),
         ],
     ).send()
 
 
-@cl.action_callback("connect_holidays")
-async def connect_holidays(action: cl.Action):
+@cl.action_callback("suggest_enrichment")
+async def suggest_enrichment_action(action: cl.Action):
+    df = cl.user_session.get("df_enriched")
+    if df is None:
+        df = cl.user_session.get("df")
+
+    mapping = cl.user_session.get("mapping") or {}
+
+    if df is None:
+        await cl.Message(content="No dataset loaded.").send()
+        return
+
+    suggestion = await recommend_enrichment(df, mapping, "explain delays", "internal explanation requested")
+    if not suggestion:
+        await cl.Message(content="No external enrichment is strongly justified right now.").send()
+        return
+
+    await cl.Message(
+        content=(
+            "Recommended enrichment:\n\n"
+            f"- Source: `{suggestion['source_id']}`\n"
+            f"- Why: {suggestion['reason']}\n"
+            f"- Confidence: {suggestion['confidence']:.2f}"
+        ),
+        actions=[
+            cl.Action(
+                name="connect_datasource",
+                payload={"source_id": suggestion["source_id"]},
+                label=f"Connect {suggestion['source_id']}",
+                icon="plug",
+            )
+        ],
+    ).send()
+
+
+@cl.action_callback("connect_datasource")
+async def connect_datasource_action(action: cl.Action):
+    source_id = ((action.payload or {}).get("source_id") or "").strip().lower()
+    if not source_id:
+        await cl.Message(content="Missing datasource id.").send()
+        return
+
     df = cl.user_session.get("df")
     mapping = cl.user_session.get("mapping") or {}
     if df is None:
         await cl.Message(content="No dataset loaded.").send()
         return
 
-    async with cl.Step(name="Connect holidays") as step:
-        step.output = "Validating dataset columns and mapping..."
+    try:
+        async with cl.Step(name=f"Connect datasource: {source_id}") as step:
+            step.output = "Fetching external data and enriching your dataset..."
+            enriched, meta = await asyncio.to_thread(connect_datasource, df, mapping, source_id)
+            cl.user_session.set("df_enriched", enriched)
+            cl.user_session.set("holidays_connected", source_id == "openholidays")
+            step.output = "Datasource connected. Recomputing derived metrics..."
+            derived = await asyncio.to_thread(ensure_derived, enriched, mapping)
+            cl.user_session.set("df_enriched", derived)
+            step.output = "Datasource enrichment complete."
+    except Exception as exc:
+        await cl.Message(content=f"Could not connect datasource `{source_id}`: {exc}").send()
+        return
 
-        # Determine countries + date range from dataset
-        if "country" not in df.columns:
-            await cl.Message(content="Your dataset has no `country` column, so I can’t join holidays.").send()
-            return
-
-        exp_col = mapping.get("expected_arrival_at")
-        if not exp_col or exp_col not in df.columns:
-            await cl.Message(content="Missing `expected_arrival_at` mapping.").send()
-            return
-
-        exp = pd.to_datetime(df[exp_col], errors="coerce", utc=True)
-        start_date = exp.min().strftime("%Y-%m-%d")
-        end_date = exp.max().strftime("%Y-%m-%d")
-
-        countries = sorted(
-            [c for c in df["country"].dropna().unique().tolist() if isinstance(c, str)])
-
-        step.output = f"Fetching holidays for {len(countries)} countries ({start_date} to {end_date})..."
-
-        # Fetch from OpenHolidays
-        all_h = []
-        for idx, c in enumerate(countries, start=1):
-            try:
-                all_h.append(await asyncio.to_thread(fetch_holidays, c, start_date, end_date))
-                step.output = f"Fetched {idx}/{len(countries)} countries..."
-            except Exception:
-                step.output = f"Skipped {c} due to API error ({idx}/{len(countries)})."
-                continue
-
-        holidays_df = pd.concat(all_h, ignore_index=True) if all_h else pd.DataFrame(
-            columns=["country", "date", "name"])
-        cl.user_session.set("holidays_df", holidays_df)
-
-        step.output = "Enriching payouts with holiday flags..."
-        enriched = await asyncio.to_thread(enrich_with_holidays, df, holidays_df, mapping)
-        cl.user_session.set("df_enriched", enriched)
-        cl.user_session.set("holidays_connected", True)
-
-        step.output = "Computing holiday delay comparison..."
-
-        # Quick explanation metrics
-        from metrics import add_derived_columns
-        derived = await asyncio.to_thread(add_derived_columns, enriched, mapping)
-        derived["is_bank_holiday"] = enriched.get("is_bank_holiday", False)
-
-    if "delay_hours" in derived.columns:
-        holiday_avg = derived.loc[derived["is_bank_holiday"] &
-                                  derived["delay_hours"].notna(), "delay_hours"].mean()
-        non_avg = derived.loc[(~derived["is_bank_holiday"]) &
-                              derived["delay_hours"].notna(), "delay_hours"].mean()
+    if source_id == "openholidays" and "delay_hours" in derived.columns and "is_bank_holiday" in derived.columns:
+        holiday_avg = derived.loc[derived["is_bank_holiday"] & derived["delay_hours"].notna(), "delay_hours"].mean()
+        non_avg = derived.loc[(~derived["is_bank_holiday"]) & derived["delay_hours"].notna(), "delay_hours"].mean()
 
         await cl.Message(
             content=(
-                "✅ Connected OpenHolidaysAPI and enriched payouts.\n\n"
-                f"- Avg delay on bank holidays: **{holiday_avg:.2f}h**\n"
-                f"- Avg delay on non-holidays: **{non_avg:.2f}h**\n\n"
+                f"Connected `{source_id}` ({meta.get('base_url')}).\n\n"
+                f"- Avg delay on holidays: **{holiday_avg:.2f}h**\n"
+                f"- Avg delay on non-holidays: **{non_avg:.2f}h**\n"
+                f"- Countries processed: **{meta.get('country_count', 0)}**"
             ),
             actions=[
                 cl.Action(
                     name="ask_followup",
                     payload={"q": "show top delays with holiday names"},
-                    label="📌 Show top delays with holiday names",
-                ),
+                    label="Show top delays with holiday names",
+                    icon="pin",
+                )
             ],
         ).send()
-    else:
-        await cl.Message(content="Connected holidays, but delay_hours is missing.").send()
+        return
+
+    await cl.Message(content=f"Connected `{source_id}` and enriched your dataset.").send()
+
+
+@cl.action_callback("connect_holidays")
+async def connect_holidays_backward_compat(action: cl.Action):
+    action.payload = {"source_id": "openholidays"}
+    await connect_datasource_action(action)
 
 @cl.action_callback("explain_anomaly")
 async def explain_anomaly(action: cl.Action):
@@ -362,7 +445,7 @@ async def explain_anomaly(action: cl.Action):
 
     await cl.Message(
         content=(
-            "### ⚡ Biggest anomaly detected\n\n"
+            "### Biggest anomaly detected\n\n"
             f"- Metric: **{anomaly['metric']}**\n"
             f"- Z-score: **{anomaly['z_score']:.2f}**\n"
             f"- Row: `{anomaly['row']}`\n\n"
@@ -391,7 +474,8 @@ async def ask_followup(action: cl.Action):
             cl.Action(
                 name="ask_followup",
                 payload={"q": "explain holiday impact"},
-                label="🧠 Explain holiday impact",
+                label="Explain holiday impact",
+                icon="brain",
             )
         ]
 
