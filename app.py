@@ -181,7 +181,11 @@ async def on_message(msg: cl.Message):
         final_response = f"_AI deep analysis_\n\n{final_response}"
     await cl.Message(content=final_response).send()
 
+    connected_sources = set(cl.user_session.get("connected_datasources") or [])
     suggestion = await recommend_enrichment(df, mapping, msg.content or "", response or "")
+    if suggestion and suggestion.get("source_id") in connected_sources:
+        suggestion = None
+
     if suggestion:
         await cl.Message(
             content=(
@@ -355,9 +359,14 @@ async def suggest_enrichment_action(action: cl.Action):
         await cl.Message(content="No dataset loaded.").send()
         return
 
+    connected_sources = set(cl.user_session.get("connected_datasources") or [])
     suggestion = await recommend_enrichment(df, mapping, "explain delays", "internal explanation requested")
     if not suggestion:
         await cl.Message(content="No external enrichment is strongly justified right now.").send()
+        return
+
+    if suggestion.get("source_id") in connected_sources:
+        await cl.Message(content=f"Datasource `{suggestion['source_id']}` is already connected.").send()
         return
 
     await cl.Message(
