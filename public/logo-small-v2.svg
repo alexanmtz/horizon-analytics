@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 28 28" fill="none">
+  <!-- Outline container -->
+  <circle cx="14" cy="14" r="12.5" stroke="#095D8F" stroke-opacity="0.35" stroke-width="1.5"/>
+
+  <!-- Horizon -->
+  <path d="M6 16.5 Q14 13 22 16.5" stroke="#095D8F" stroke-width="2" stroke-linecap="round" fill="none"/>
+
+  <!-- Rising signal bars -->
+  <path d="M10 16.2 V13.8" stroke="#095D8F" stroke-width="2" stroke-linecap="round"/>
+  <path d="M14 16.2 V12.2" stroke="#095D8F" stroke-width="2" stroke-linecap="round"/>
+  <path d="M18 16.2 V10.8" stroke="#095D8F" stroke-width="2" stroke-linecap="round"/>
+</svg>

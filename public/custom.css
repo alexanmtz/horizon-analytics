@@ -1,0 +1,7 @@
+img[src*="logo-small-v2.svg"] {
+  filter: none;
+}
+
+.dark img[src*="logo-small-v2.svg"] {
+  filter: brightness(0) saturate(100%) invert(100%);
+}
