@@ -1,4 +1,4 @@
-import re
+from difflib import SequenceMatcher
 import pandas as pd
 
 
@@ -13,70 +13,145 @@ DEFAULT_KEYS = [
     "arrival_at",
 ]
 
-PATTERNS = {
-    "id": [r"\bid\b", r"payout_id", r"transfer_id", r"transaction_id"],
-    "status": [r"status", r"state"],
-    "amount": [r"amount", r"net", r"gross", r"total", r"value"],
-    "currency": [r"currency", r"ccy"],
-    "created_at": [r"created", r"created_at", r"creation"],
-    "paid_at": [r"paid", r"paid_at", r"initiated", r"sent_at"],
-    "expected_arrival_at": [r"expected.*arrival", r"eta", r"expected_at"],
-    "arrival_at": [r"arrival", r"arrived", r"settled", r"landing", r"available_at"],
-}
-
-
 def suggest_mapping(df: pd.DataFrame) -> dict:
     cols = list(df.columns)
     mapping = {k: None for k in DEFAULT_KEYS}
+    profiles = {col: _column_profile(df, col) for col in cols}
 
-    # 1) name-based regex
-    for key, pats in PATTERNS.items():
+    score_rows: list[tuple[str, str, float]] = []
+    for key in DEFAULT_KEYS:
         for col in cols:
-            for pat in pats:
-                if re.search(pat, col, flags=re.IGNORECASE):
-                    mapping[key] = col
-                    break
-            if mapping[key]:
-                break
+            name_score = _name_similarity_score(key, col)
+            behavior_score = _behavior_score(key, profiles[col])
+            total = (0.55 * name_score) + (0.45 * behavior_score)
+            score_rows.append((key, col, total))
 
-    # 2) heuristic: detect datetime/parseable columns
-    dt_candidates = guess_datetime_cols(df)
-    # If arrival/paid/etc was not found, fallback to best candidates
-    if mapping["created_at"] is None and dt_candidates:
-        mapping["created_at"] = dt_candidates[0]
-    if mapping["paid_at"] is None and len(dt_candidates) > 1:
-        mapping["paid_at"] = dt_candidates[1]
-    if mapping["arrival_at"] is None and len(dt_candidates) > 2:
-        mapping["arrival_at"] = dt_candidates[2]
+    # Greedy assignment with conflict resolution by highest score.
+    score_rows.sort(key=lambda row: row[2], reverse=True)
+    used_cols = set()
+    for key, col, score in score_rows:
+        if mapping[key] is not None:
+            continue
+        if col in used_cols:
+            continue
+        if score < 0.33:
+            continue
+        mapping[key] = col
+        used_cols.add(col)
 
+    _fill_temporal_fallbacks(df, mapping)
     return mapping
 
 
 def guess_datetime_cols(df: pd.DataFrame) -> list[str]:
-    candidates = []
-    for c in df.columns:
-        if "date" in c or c.endswith("_at") or "time" in c:
-            candidates.append(c)
-
-    # try parsing candidates
     ok = []
-    for c in candidates:
+    for c in df.columns:
         try:
             parsed = pd.to_datetime(df[c], errors="coerce", utc=True)
             if parsed.notna().mean() > 0.6:  # 60% parseable
                 ok.append(c)
         except Exception:
             continue
+    return ok
 
-    # sort with preference: arrival/paid/created
-    priority = {"arrival": 0, "paid": 1, "created": 2}
-    def score(col: str) -> tuple[int, str]:
-        for k, v in priority.items():
-            if k in col:
-                return (v, col)
-        return (9, col)
 
-    return sorted(ok, key=score)
+def _column_profile(df: pd.DataFrame, col: str) -> dict:
+    s = df[col]
+    n = max(len(s), 1)
+
+    notna = s.notna().sum()
+    unique = s.dropna().nunique()
+
+    numeric = pd.to_numeric(s, errors="coerce")
+    numeric_ratio = float(numeric.notna().mean())
+
+    dt = pd.to_datetime(s, errors="coerce", utc=True)
+    datetime_ratio = float(dt.notna().mean())
+
+    str_s = s.dropna().astype(str)
+    avg_len = float(str_s.str.len().mean()) if len(str_s) > 0 else 0.0
+    alpha_ratio = float(str_s.str.fullmatch(r"[A-Za-z]+", na=False).mean()) if len(str_s) > 0 else 0.0
+
+    return {
+        "notna_ratio": float(notna / n),
+        "unique_ratio": float(unique / max(notna, 1)),
+        "numeric_ratio": numeric_ratio,
+        "datetime_ratio": datetime_ratio,
+        "avg_len": avg_len,
+        "alpha_ratio": alpha_ratio,
+    }
+
+
+def _name_similarity_score(key: str, col: str) -> float:
+    key_tokens = [t for t in key.lower().split("_") if t and t not in {"at"}]
+    col_tokens = [t for t in str(col).lower().split("_") if t and t not in {"at"}]
+
+    if not key_tokens or not col_tokens:
+        return 0.0
+
+    overlap = len(set(key_tokens) & set(col_tokens))
+    token_score = overlap / max(len(set(key_tokens) | set(col_tokens)), 1)
+    seq_score = SequenceMatcher(None, key.lower(), str(col).lower()).ratio()
+
+    return float((0.6 * token_score) + (0.4 * seq_score))
+
+
+def _behavior_score(key: str, p: dict) -> float:
+    if key in {"created_at", "paid_at", "expected_arrival_at", "arrival_at"}:
+        return p["datetime_ratio"]
+
+    if key == "amount":
+        dense_numeric = p["numeric_ratio"]
+        variability = min(1.0, p["unique_ratio"] * 1.5)
+        return float((0.7 * dense_numeric) + (0.3 * variability))
+
+    if key == "currency":
+        short_codes = max(0.0, 1.0 - abs(p["avg_len"] - 3.0) / 5.0)
+        low_cardinality = max(0.0, 1.0 - p["unique_ratio"])
+        return float((0.45 * p["alpha_ratio"]) + (0.35 * short_codes) + (0.20 * low_cardinality))
+
+    if key == "status":
+        low_cardinality = max(0.0, 1.0 - p["unique_ratio"])
+        non_numeric = 1.0 - p["numeric_ratio"]
+        return float((0.65 * low_cardinality) + (0.35 * non_numeric))
+
+    if key == "id":
+        non_datetime = 1.0 - p["datetime_ratio"]
+        high_uniqueness = p["unique_ratio"]
+        return float((0.55 * high_uniqueness) + (0.45 * non_datetime))
+
+    return 0.0
+
+
+def _fill_temporal_fallbacks(df: pd.DataFrame, mapping: dict) -> None:
+    temporal_keys = ["created_at", "paid_at", "expected_arrival_at", "arrival_at"]
+    unresolved = [k for k in temporal_keys if not mapping.get(k)]
+    if not unresolved:
+        return
+
+    dt_cols = guess_datetime_cols(df)
+    dt_cols = [c for c in dt_cols if c not in set(mapping.values())]
+    if not dt_cols:
+        return
+
+    def dt_median(col: str):
+        parsed = pd.to_datetime(df[col], errors="coerce", utc=True)
+        return parsed.dropna().median()
+
+    ranked = []
+    for c in dt_cols:
+        med = dt_median(c)
+        if med is not pd.NaT:
+            ranked.append((c, med))
+
+    if not ranked:
+        return
+
+    ranked.sort(key=lambda row: row[1])
+    ordered_cols = [c for c, _ in ranked]
+
+    for key, col in zip(unresolved, ordered_cols):
+        mapping[key] = col
 
 
 def apply_mapping_override(current: dict, command: str) -> dict:

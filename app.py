@@ -6,6 +6,7 @@ import chainlit as cl
 from helpers.followup_profile import followup_profile
 from helpers.ai_brief_from_metrics import ai_brief_from_metrics
 from helpers.ai_followups import suggest_followups
+from helpers.ai_holiday_impact import ai_explain_holiday_impact
 from helpers.anomaly import ai_explain_anomaly, detect_biggest_anomaly
 from ingest import load_table, load_table_from_text
 from profiling import profile_df
@@ -312,14 +313,14 @@ async def _generate_initial_insights(
             cl.Action(name="explain_anomaly", payload={"action": "explain"}, label="Explain biggest anomaly", icon="zap"),
             cl.Action(
                 name="ask_followup",
-                payload={"q": "show top delays with holiday names"},
-                label="Show top delays with holiday names",
+                payload={"q": "show the most unusual records and why they stand out"},
+                label="Show unusual records",
                 icon="pin",
             ),
             cl.Action(
                 name="ask_followup",
-                payload={"q": "explain holiday impact"},
-                label="Explain holiday impact",
+                payload={"q": "what are the strongest patterns or segments in this dataset"},
+                label="Explain strongest patterns",
                 icon="brain",
             ),
         ],
@@ -389,14 +390,24 @@ async def connect_datasource_action(action: cl.Action):
         return
 
     if source_id == "openholidays" and "delay_hours" in derived.columns and "is_bank_holiday" in derived.columns:
-        holiday_avg = derived.loc[derived["is_bank_holiday"] & derived["delay_hours"].notna(), "delay_hours"].mean()
-        non_avg = derived.loc[(~derived["is_bank_holiday"]) & derived["delay_hours"].notna(), "delay_hours"].mean()
+        holiday_delay = derived.loc[derived["is_bank_holiday"] & derived["delay_hours"].notna(), "delay_hours"]
+        non_holiday_delay = derived.loc[(~derived["is_bank_holiday"]) & derived["delay_hours"].notna(), "delay_hours"]
+
+        holiday_count = int(holiday_delay.shape[0])
+        non_holiday_count = int(non_holiday_delay.shape[0])
+
+        holiday_avg_text = f"{holiday_delay.mean():.2f}h" if holiday_count > 0 else "N/A (no matched holiday payouts)"
+        non_avg_text = f"{non_holiday_delay.mean():.2f}h" if non_holiday_count > 0 else "N/A"
+
+        holidays_rows = int(meta.get("holidays_rows", 0) or 0)
 
         await cl.Message(
             content=(
                 f"Connected `{source_id}` ({meta.get('base_url')}).\n\n"
-                f"- Avg delay on holidays: **{holiday_avg:.2f}h**\n"
-                f"- Avg delay on non-holidays: **{non_avg:.2f}h**\n"
+                f"- Avg delay on holidays: **{holiday_avg_text}**\n"
+                f"- Avg delay on non-holidays: **{non_avg_text}**\n"
+                f"- Holiday-matched payouts: **{holiday_count}**\n"
+                f"- Holiday rows fetched: **{holidays_rows}**\n"
                 f"- Countries processed: **{meta.get('country_count', 0)}**"
             ),
             actions=[
@@ -463,13 +474,28 @@ async def ask_followup(action: cl.Action):
 
     mapping = cl.user_session.get("mapping") or {}
 
+    q_norm = (q or "").strip().lower()
+
+    if q_norm == "explain holiday impact":
+        if df is None:
+            await cl.Message(content="Upload a dataset first.").send()
+            return
+
+        async with cl.Step(name="Run follow-up") as step:
+            step.output = "Analyzing holiday impact from enriched data..."
+            response = await ai_explain_holiday_impact(df, mapping)
+            step.output = "Follow-up ready."
+
+        await cl.Message(content=f"**Follow-up:** {q}\n\n{response}").send()
+        return
+
     async with cl.Step(name="Run follow-up") as step:
         step.output = "Analyzing follow-up question..."
         response = await asyncio.to_thread(answer_question, df, mapping, q)
         step.output = "Follow-up ready."
 
     followup_actions = None
-    if (q or "").strip().lower() == "show top delays with holiday names":
+    if q_norm == "show top delays with holiday names":
         followup_actions = [
             cl.Action(
                 name="ask_followup",

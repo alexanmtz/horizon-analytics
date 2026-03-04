@@ -55,6 +55,64 @@ def answer_question(df, mapping, question: str) -> str:
 
         return format_table(top, cols)
 
+    # 3.5️⃣ Explain holiday impact directly from enriched columns
+    if "holiday" in q and ("impact" in q or "explain" in q):
+        if "is_bank_holiday" not in df.columns:
+            return "Holiday enrichment is not connected yet. Ask me to suggest an external calendar datasource."
+
+        if "delay_hours" not in derived.columns:
+            return "Delay metrics not available."
+
+        holiday_delay = derived.loc[
+            derived["is_bank_holiday"] & derived["delay_hours"].notna(),
+            "delay_hours"
+        ]
+        non_holiday_delay = derived.loc[
+            (~derived["is_bank_holiday"]) & derived["delay_hours"].notna(),
+            "delay_hours"
+        ]
+
+        holiday_count = int(holiday_delay.shape[0])
+        non_holiday_count = int(non_holiday_delay.shape[0])
+
+        if holiday_count == 0:
+            return (
+                "Holiday enrichment is connected, but there are no payout rows matched to holidays "
+                "in the current dataset/date range."
+            )
+
+        holiday_avg = float(holiday_delay.mean()) if holiday_count > 0 else float("nan")
+        non_avg = float(non_holiday_delay.mean()) if non_holiday_count > 0 else float("nan")
+
+        ratio_text = "N/A"
+        if pd.notna(non_avg) and non_avg > 0:
+            ratio_text = f"{holiday_avg / non_avg:.2f}x"
+
+        findings = [
+            "🧠 Explanation",
+            "",
+            f"- Holiday payouts analyzed: **{holiday_count}**",
+            f"- Non-holiday payouts analyzed: **{non_holiday_count}**",
+            f"- Avg delay on holidays: **{holiday_avg:.2f}h**",
+            f"- Avg delay on non-holidays: **{non_avg:.2f}h**" if pd.notna(non_avg) else "- Avg delay on non-holidays: **N/A**",
+            f"- Relative holiday impact: **{ratio_text}**",
+        ]
+
+        if "holiday_name" in derived.columns:
+            top_holidays = (
+                derived.loc[derived["is_bank_holiday"] & derived["holiday_name"].astype(str).str.len().gt(0)]
+                .groupby("holiday_name")["delay_hours"]
+                .agg(["mean", "count"])
+                .sort_values(["mean", "count"], ascending=[False, False])
+                .head(3)
+            )
+            if not top_holidays.empty:
+                findings.append("- Highest-delay holiday names in this data:")
+                for name, row in top_holidays.iterrows():
+                    findings.append(f"  - {name}: {row['mean']:.2f}h (n={int(row['count'])})")
+
+        return "\n".join(findings)
+
     # 4️⃣ Why question (smart explanation)
     if "why" in q or "explain" in q:
         return _reason_discovery_summary(derived, mapping)
