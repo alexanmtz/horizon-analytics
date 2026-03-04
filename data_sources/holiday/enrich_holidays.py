@@ -56,8 +56,11 @@ def enrich_with_holidays(payouts: pd.DataFrame, holidays: pd.DataFrame, mapping:
         right_on=["country", "date"],
     )
 
-    joined["holiday_name"] = joined["holiday_name"].fillna("").astype(str)
-    joined["is_bank_holiday"] = joined["holiday_name"].str.len() > 0
+    matched_holiday = joined["date"].notna()
+    joined["holiday_name"] = joined["holiday_name"].fillna("").astype(str).str.strip()
+    blank_name = joined["holiday_name"].eq("") | joined["holiday_name"].str.lower().isin(["nan", "none", "nat"])
+    joined.loc[matched_holiday & blank_name, "holiday_name"] = "Unnamed holiday"
+    joined["is_bank_holiday"] = matched_holiday
 
     # keep it tidy
     if "date" in joined.columns:

@@ -1,14 +1,36 @@
-# Welcome to Chainlit! 🚀🤖
+# Horizon Analytics
 
-Hi there, Developer! 👋 We're excited to have you on board. Chainlit is a powerful tool designed to help you prototype, debug and share applications built on top of LLMs.
+AI-first analytics for payout and operations datasets.
 
-## Useful Links 🔗
+## How to start
 
-- **Documentation:** Get started with our comprehensive [Chainlit Documentation](https://docs.chainlit.io) 📚
-- **Discord Community:** Join our friendly [Chainlit Discord](https://discord.gg/k73SQ3FyUh) to ask questions, share your projects, and connect with other developers! 💬
+1. Upload a **CSV** or **XLSX** file, or paste tabular data (CSV/TSV with header).
+2. Review the suggested semantic mapping (`arrival_at`, `expected_arrival_at`).
+3. Confirm mapping to generate the initial metrics brief.
+4. Ask follow-up questions to investigate delays, anomalies, and drivers.
 
-We can't wait to see what you create with Chainlit! Happy coding! 💻😊
+Sample datasets:
+https://github.com/alexanmtz/horizon-analytics/tree/main/sample_data
 
-## Welcome screen
+## What you can ask
 
-To modify the welcome screen, edit the `chainlit.md` file at the root of your project. If you do not want a welcome screen, just leave this file empty.
+- "What is the average delay and how is it trending?"
+- "Show the biggest anomalies and explain likely causes."
+- "Break down delays by transfer type and amount buckets."
+- "Which factors most influence late arrivals?"
+- "Show top delays with holiday names."
+
+## Enrichment support
+
+The assistant can recommend and connect external enrichments (for example, holidays via OpenHolidays) when useful.
+
+After enrichment, you can ask:
+
+- "Explain holiday impact"
+- "Compare holiday vs non-holiday delay"
+
+## Tips
+
+- Use clear date and business context in questions for better answers.
+- If the mapping looks wrong, use the **Override Mapping** action before confirming.
+- You can always continue exploring with suggested follow-up actions in the chat.

@@ -2,6 +2,8 @@
 
 AI-first analytics for uploaded tables.
 
+Sample datasets: https://github.com/alexanmtz/horizon-analytics/tree/main/sample_data
+
 ## Run locally
 
 ```bash

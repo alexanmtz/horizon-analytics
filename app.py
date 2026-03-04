@@ -7,6 +7,7 @@ from helpers.followup_profile import followup_profile
 from helpers.ai_brief_from_metrics import ai_brief_from_metrics
 from helpers.ai_followups import suggest_followups
 from helpers.ai_holiday_impact import ai_explain_holiday_impact
+from helpers.ai_qa import ai_answer_question, should_use_llm_for_question
 from helpers.anomaly import ai_explain_anomaly, detect_biggest_anomaly
 from ingest import load_table, load_table_from_text
 from profiling import profile_df
@@ -24,8 +25,17 @@ load_dotenv()
 @cl.on_chat_start
 async def on_chat_start():
     cl.user_session.set("df", None)
+    cl.user_session.set("df_enriched", None)
     cl.user_session.set("mapping", {})
-    await cl.Message(content="Upload a CSV/XLSX to begin or paste the data here.").send()
+    cl.user_session.set("holidays_connected", False)
+    cl.user_session.set("connected_datasources", [])
+    await cl.Message(
+        content=(
+            "Upload a CSV/XLSX to begin or paste the data here. \n"
+            "You can also get a sample dataset at: \n"
+            "https://github.com/alexanmtz/horizon-analytics/tree/main/sample_data"
+        )
+    ).send()
 
 
 @cl.on_message
@@ -45,6 +55,9 @@ async def on_message(msg: cl.Message):
             step.output = "Reading uploaded file..."
             df = await asyncio.to_thread(load_table, file_el.path)
             cl.user_session.set("df", df)
+            cl.user_session.set("df_enriched", None)
+            cl.user_session.set("holidays_connected", False)
+            cl.user_session.set("connected_datasources", [])
 
             step.output = "Inferring semantic column mapping..."
             mapping = await asyncio.to_thread(suggest_mapping, df)
@@ -73,6 +86,9 @@ async def on_message(msg: cl.Message):
                 return
 
             cl.user_session.set("df", df)
+            cl.user_session.set("df_enriched", None)
+            cl.user_session.set("holidays_connected", False)
+            cl.user_session.set("connected_datasources", [])
 
             step.output = "Inferring semantic column mapping..."
             mapping = await asyncio.to_thread(suggest_mapping, df)
@@ -138,10 +154,20 @@ async def on_message(msg: cl.Message):
         return
 
     mapping = cl.user_session.get("mapping") or {}
+    used_ai_deep_analysis = False
 
     async with cl.Step(name="Answer question") as step:
         step.output = "Running analytics Q&A..."
-        response = await asyncio.to_thread(answer_question, df, mapping, (msg.content or ""))
+        user_question = msg.content or ""
+        response = await asyncio.to_thread(answer_question, df, mapping, user_question)
+
+        if should_use_llm_for_question(user_question, response or ""):
+            step.output = "Generating deeper AI answer..."
+            try:
+                response = await ai_answer_question(df, mapping, user_question, response or "")
+                used_ai_deep_analysis = True
+            except Exception:
+                print("AI QA fallback error:\n", traceback.format_exc())
 
         step.output = "Generating suggested follow-up questions..."
         profile = await asyncio.to_thread(followup_profile, df, mapping)
@@ -150,7 +176,10 @@ async def on_message(msg: cl.Message):
         step.output = "Q&A complete."
 
     # Send the main answer
-    await cl.Message(content=response or "DEBUG: QA returned empty").send()
+    final_response = response or "DEBUG: QA returned empty"
+    if used_ai_deep_analysis:
+        final_response = f"_AI deep analysis_\n\n{final_response}"
+    await cl.Message(content=final_response).send()
 
     suggestion = await recommend_enrichment(df, mapping, msg.content or "", response or "")
     if suggestion:
@@ -310,19 +339,6 @@ async def _generate_initial_insights(
         ),
        actions=[
             cl.Action(name="suggest_enrichment", payload={"reason": "initial_insights"}, label="Suggest Enrichment", icon="plug"),
-            cl.Action(name="explain_anomaly", payload={"action": "explain"}, label="Explain biggest anomaly", icon="zap"),
-            cl.Action(
-                name="ask_followup",
-                payload={"q": "show the most unusual records and why they stand out"},
-                label="Show unusual records",
-                icon="pin",
-            ),
-            cl.Action(
-                name="ask_followup",
-                payload={"q": "what are the strongest patterns or segments in this dataset"},
-                label="Explain strongest patterns",
-                icon="brain",
-            ),
         ],
     ).send()
 
@@ -369,7 +385,9 @@ async def connect_datasource_action(action: cl.Action):
         await cl.Message(content="Missing datasource id.").send()
         return
 
-    df = cl.user_session.get("df")
+    df = cl.user_session.get("df_enriched")
+    if df is None:
+        df = cl.user_session.get("df")
     mapping = cl.user_session.get("mapping") or {}
     if df is None:
         await cl.Message(content="No dataset loaded.").send()
@@ -380,7 +398,12 @@ async def connect_datasource_action(action: cl.Action):
             step.output = "Fetching external data and enriching your dataset..."
             enriched, meta = await asyncio.to_thread(connect_datasource, df, mapping, source_id)
             cl.user_session.set("df_enriched", enriched)
-            cl.user_session.set("holidays_connected", source_id == "openholidays")
+            already_connected = set(cl.user_session.get("connected_datasources") or [])
+            already_connected.add(source_id)
+            cl.user_session.set("connected_datasources", sorted(already_connected))
+
+            previous_holidays_connected = bool(cl.user_session.get("holidays_connected"))
+            cl.user_session.set("holidays_connected", previous_holidays_connected or source_id == "openholidays")
             step.output = "Datasource connected. Recomputing derived metrics..."
             derived = await asyncio.to_thread(ensure_derived, enriched, mapping)
             cl.user_session.set("df_enriched", derived)
@@ -475,6 +498,7 @@ async def ask_followup(action: cl.Action):
     mapping = cl.user_session.get("mapping") or {}
 
     q_norm = (q or "").strip().lower()
+    used_ai_deep_analysis = False
 
     if q_norm == "explain holiday impact":
         if df is None:
@@ -492,6 +516,13 @@ async def ask_followup(action: cl.Action):
     async with cl.Step(name="Run follow-up") as step:
         step.output = "Analyzing follow-up question..."
         response = await asyncio.to_thread(answer_question, df, mapping, q)
+        if should_use_llm_for_question(q or "", response or ""):
+            step.output = "Generating deeper AI follow-up answer..."
+            try:
+                response = await ai_answer_question(df, mapping, q or "", response or "")
+                used_ai_deep_analysis = True
+            except Exception:
+                print("AI follow-up QA fallback error:\n", traceback.format_exc())
         step.output = "Follow-up ready."
 
     followup_actions = None
@@ -505,7 +536,11 @@ async def ask_followup(action: cl.Action):
             )
         ]
 
+    followup_content = f"**Follow-up:** {q}\n\n{response}"
+    if used_ai_deep_analysis:
+        followup_content = f"_AI deep analysis_\n\n{followup_content}"
+
     await cl.Message(
-        content=f"**Follow-up:** {q}\n\n{response}",
+        content=followup_content,
         actions=followup_actions,
     ).send()
