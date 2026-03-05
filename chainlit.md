@@ -86,6 +86,7 @@ Main components:
 - **Python + Pandas** for data inspection and transformation
 - **OpenAI models** for reasoning and hypothesis generation
 - **External APIs** (e.g., holiday datasets) for contextual enrichment
+- **Deploy** Deployed on https://render.com/
 
 ---
 
