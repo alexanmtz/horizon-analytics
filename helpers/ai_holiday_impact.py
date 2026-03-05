@@ -1,6 +1,6 @@
 import pandas as pd
 
-from clients.openai_client import client
+from clients.openai_client import call_openai_with_retries, client
 
 
 def summarize_holiday_impact(df: pd.DataFrame) -> dict | None:
@@ -103,13 +103,16 @@ Output in markdown:
 Do not claim causality. Keep concise.
 """.strip()
 
-    try:
-        resp = await client.chat.completions.create(
+    resp = await call_openai_with_retries(
+        lambda: client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=260,
         )
+    )
+    if resp:
         text = resp.choices[0].message.content or ""
-        return text.strip() or holiday_impact_fallback_markdown(summary)
-    except Exception:
-        return holiday_impact_fallback_markdown(summary)
+        if text.strip():
+            return text.strip()
+
+    return holiday_impact_fallback_markdown(summary)

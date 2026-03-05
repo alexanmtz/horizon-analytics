@@ -11,6 +11,8 @@ For example, when analyzing payout delays, a table may contain timestamps, count
 - settlement windows  
 - payment infrastructure differences  
 
+## Why
+
 Traditional analytics platforms focus on querying internal data. When external context is required, users must manually discover, fetch, and integrate those sources themselves.
 
 I wanted to explore a different approach: **an analytics system that actively identifies missing context and suggests external knowledge sources during analysis.**
@@ -19,17 +21,12 @@ This led to the concept of **Horizon** — an AI-first analytics assistant desig
 
 ---
 
-## Solution
-
-Horizon is a conversational analytics tool where the AI is responsible for driving the analytical workflow.
-
-Instead of starting with dashboards or predefined queries, the user uploads a dataset and begins exploring it through conversation.
+## Workflow
 
 A small **demo dataset is included in the repository** to illustrate the workflow:
 
 https://github.com/alexanmtz/horizon-analytics/tree/main/sample_data
 
-Example workflow:
 
 1. The user uploads a dataset (e.g., a payouts table).
 2. Horizon generates a structural overview of the data.

@@ -32,6 +32,8 @@ CORE_MAPPING_KEYS = [
     "arrival_at",
 ]
 
+ENRICHMENT_SNOOZED_KEY = "enrichment_snoozed"
+
 
 def _mapping_summary_markdown(mapping: dict | None, max_items: int = 20) -> str:
     mapping = mapping or {}
@@ -89,6 +91,45 @@ def _is_delay_explanation_question(question: str) -> bool:
     return has_delay_topic and has_explain_intent
 
 
+def _is_holiday_enrichment_context_question(question: str, df) -> bool:
+    if df is None or "holiday_name" not in df.columns:
+        return False
+
+    q = (question or "").lower()
+    if not q.strip():
+        return False
+
+    holiday_terms = [
+        "holiday",
+        "bank holiday",
+        "christmas",
+        "xmas",
+        "easter",
+        "good friday",
+        "pentecost",
+        "new year",
+    ]
+    if any(term in q for term in holiday_terms):
+        return True
+
+    return " on " in q and any(token in q for token in ["how many", "count", "number of", "payout", "payouts"])
+
+
+def _is_explicit_enrichment_intent(text: str) -> bool:
+    q = (text or "").strip().lower()
+    if not q:
+        return False
+
+    direct_phrases = [
+        "suggest enrichment",
+        "enrichment",
+        "show enrichment",
+        "recommend enrichment",
+        "connect enrichment",
+    ]
+    return any(phrase in q for phrase in direct_phrases)
+
+
 def _fallback_openholidays_suggestion(df, mapping: dict) -> dict | None:
     if df is None:
         return None
@@ -107,7 +148,27 @@ def _fallback_openholidays_suggestion(df, mapping: dict) -> dict | None:
     }
 
 
+def _is_enrichment_snoozed() -> bool:
+    return bool(cl.user_session.get(ENRICHMENT_SNOOZED_KEY, False))
+
+
+def _set_enrichment_snoozed(value: bool) -> None:
+    cl.user_session.set(ENRICHMENT_SNOOZED_KEY, value)
+
+
+def _should_show_suggest_enrichment_action(force: bool = False) -> bool:
+    connected_sources = set(cl.user_session.get("connected_datasources") or [])
+    if len(connected_sources) > 0:
+        return False
+    if force:
+        return True
+    return not _is_enrichment_snoozed()
+
+
 async def _suggest_enrichment_if_relevant(df, mapping: dict, question: str, response: str) -> None:
+    if not _should_show_suggest_enrichment_action():
+        return
+
     if not cl.user_session.get("mapping_ready", False):
         return
 
@@ -134,7 +195,13 @@ async def _suggest_enrichment_if_relevant(df, mapping: dict, question: str, resp
                     payload={"source_id": suggestion["source_id"]},
                     label=f"Connect {suggestion['source_id']}",
                     icon="plug",
-                )
+                ),
+                cl.Action(
+                    name="skip_enrichment_suggestion",
+                    payload={"source_id": suggestion["source_id"]},
+                    label="Skip",
+                    icon="x",
+                ),
             ],
         ).send()
 
@@ -148,6 +215,7 @@ async def on_chat_start():
     cl.user_session.set("connected_datasources", [])
     cl.user_session.set("mapping_ready", False)
     cl.user_session.set("pending_mapping_target", None)
+    cl.user_session.set(ENRICHMENT_SNOOZED_KEY, False)
     await cl.Message(
         content=(
             "Upload a CSV/XLSX to begin or paste the data here. \n"
@@ -243,13 +311,48 @@ async def on_message(msg: cl.Message):
             ),
             actions=[
                 cl.Action(name="generate_insights", payload={"action": "generate_insights"}, label="Generate Insights", icon="sparkles"),
-                cl.Action(name="suggest_enrichment", payload={"reason": "post_upload"}, label="Suggest Enrichment", icon="plug"),
+                *(
+                    [cl.Action(name="suggest_enrichment", payload={"reason": "post_upload"}, label="Suggest Enrichment", icon="plug")]
+                    if _should_show_suggest_enrichment_action()
+                    else []
+                ),
                 cl.Action(name="show_profile", payload={"action": "profile"}, label="View Profile", icon="bar-chart-3"),
             ],
         ).send()
         return
 
     # 3) Commands
+    if _is_explicit_enrichment_intent(text):
+        _set_enrichment_snoozed(False)
+
+        df_for_enrichment = cl.user_session.get("df_enriched")
+        if df_for_enrichment is None:
+            df_for_enrichment = cl.user_session.get("df")
+
+        if df_for_enrichment is None:
+            await cl.Message(content="Upload or paste a dataset first.").send()
+            return
+
+        await cl.Message(
+            content=(
+                "You can trigger enrichment any time from here.\n\n"
+                "Click below to evaluate enrichment for the current dataset."
+            ),
+            actions=(
+                [
+                    cl.Action(
+                        name="suggest_enrichment",
+                        payload={"reason": "explicit_user_intent"},
+                        label="Suggest Enrichment",
+                        icon="plug",
+                    )
+                ]
+                if _should_show_suggest_enrichment_action(force=True)
+                else []
+            ),
+        ).send()
+        return
+
     if text.lower().startswith("map "):
         df = cl.user_session.get("df")
         if df is None:
@@ -310,11 +413,28 @@ async def on_message(msg: cl.Message):
     # Send the main answer
     final_response = response or "DEBUG: QA returned empty"
     if used_ai_deep_analysis:
-        final_response = f"_AI deep analysis_\n\n{final_response}"
+        if _is_holiday_enrichment_context_question(user_question, df):
+            final_response = f"_AI deep analysis (holiday enrichment context)_\n\n{final_response}"
+        else:
+            final_response = f"_AI deep analysis_\n\n{final_response}"
     if mapping_warnings:
         mapping_warning_text = "\n\n_Temporal mapping guard:_\n" + "\n".join([f"- {w}" for w in mapping_warnings])
         final_response = f"{final_response}{mapping_warning_text}"
-    await cl.Message(content=final_response).send()
+    await cl.Message(
+        content=final_response,
+        actions=(
+            [
+                cl.Action(
+                    name="suggest_enrichment",
+                    payload={"reason": "post_answer"},
+                    label="Suggest Enrichment",
+                    icon="plug",
+                )
+            ]
+            if _should_show_suggest_enrichment_action()
+            else []
+        ),
+    ).send()
 
     await _suggest_enrichment_if_relevant(df, mapping, msg.content or "", response or "")
 
@@ -322,8 +442,22 @@ async def on_message(msg: cl.Message):
     await cl.Message(
         content="### Suggested next questions",
         actions=[
-            cl.Action(name="ask_followup", payload={"q": q}, label=q)
-            for q in followups
+            *[
+                cl.Action(name="ask_followup", payload={"q": q}, label=q)
+                for q in followups
+            ],
+            *(
+                [
+                    cl.Action(
+                        name="suggest_enrichment",
+                        payload={"reason": "post_followup_suggestions"},
+                        label="Suggest Enrichment",
+                        icon="plug",
+                    )
+                ]
+                if _should_show_suggest_enrichment_action()
+                else []
+            ),
         ],
     ).send()
 
@@ -465,7 +599,11 @@ async def _prepare_data_preview(
         content=preview_content,
         actions=[
             cl.Action(name="generate_insights", payload={"action": "generate_insights"}, label="Generate Insights", icon="sparkles"),
-            cl.Action(name="suggest_enrichment", payload={"reason": "data_preview"}, label="Suggest Enrichment", icon="plug"),
+            *(
+                [cl.Action(name="suggest_enrichment", payload={"reason": "data_preview"}, label="Suggest Enrichment", icon="plug")]
+                if _should_show_suggest_enrichment_action()
+                else []
+            ),
         ],
     ).send()
 
@@ -549,9 +687,11 @@ async def generate_insights(action: cl.Action):
             f"{brief}\n\n"
             "Ask a question to explore this data further."
         ),
-        actions=[
-            cl.Action(name="suggest_enrichment", payload={"reason": "initial_insights"}, label="Suggest Enrichment", icon="plug"),
-        ],
+        actions=(
+            [cl.Action(name="suggest_enrichment", payload={"reason": "initial_insights"}, label="Suggest Enrichment", icon="plug")]
+            if _should_show_suggest_enrichment_action()
+            else []
+        ),
     ).send()
 
 
@@ -732,6 +872,19 @@ async def connect_datasource_action(action: cl.Action):
     await cl.Message(content=f"Connected `{source_id}` and enriched your dataset.").send()
 
 
+@cl.action_callback("skip_enrichment_suggestion")
+async def skip_enrichment_suggestion(action: cl.Action):
+    _set_enrichment_snoozed(True)
+
+    await cl.Message(
+        content=(
+            "No problem — enrichment suggestion dismissed.\n\n"
+            "You can ask for enrichment anytime by typing **Suggest enrichment**."
+        ),
+        actions=[],
+    ).send()
+
+
 @cl.action_callback("ask_followup")
 async def ask_followup(action: cl.Action):
     q = (action.payload or {}).get("q")
@@ -774,7 +927,7 @@ async def ask_followup(action: cl.Action):
                 print("AI follow-up QA fallback error:\n", traceback.format_exc())
         step.output = "Follow-up ready."
 
-    followup_actions = None
+    followup_actions = []
     if q_norm == "show top delays with holiday names":
         followup_actions = [
             cl.Action(
@@ -785,13 +938,26 @@ async def ask_followup(action: cl.Action):
             )
         ]
 
+    if _should_show_suggest_enrichment_action():
+        followup_actions.append(
+            cl.Action(
+                name="suggest_enrichment",
+                payload={"reason": "post_followup_answer"},
+                label="Suggest Enrichment",
+                icon="plug",
+            )
+        )
+
     mapping_warning_text = ""
     if mapping_warnings:
         mapping_warning_text = "\n\n_Temporal mapping guard:_\n" + "\n".join([f"- {w}" for w in mapping_warnings])
 
     followup_content = f"**Follow-up:** {q}\n\n{response}{mapping_warning_text}"
     if used_ai_deep_analysis:
-        followup_content = f"_AI deep analysis_\n\n{followup_content}"
+        if _is_holiday_enrichment_context_question(q or "", df):
+            followup_content = f"_AI deep analysis (holiday enrichment context)_\n\n{followup_content}"
+        else:
+            followup_content = f"_AI deep analysis_\n\n{followup_content}"
 
     await cl.Message(
         content=followup_content,

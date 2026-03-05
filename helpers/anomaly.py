@@ -1,5 +1,5 @@
 import pandas as pd
-from clients.openai_client import client
+from clients.openai_client import call_openai_with_retries, client
 
 def detect_biggest_anomaly(df: pd.DataFrame, mapping: dict) -> dict | None:
     """
@@ -68,8 +68,20 @@ Write:
 Keep it concise in markdown.
 """.strip()
 
-    resp = await client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[{"role": "user", "content": prompt}],
+    resp = await call_openai_with_retries(
+        lambda: client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[{"role": "user", "content": prompt}],
+        )
     )
-    return resp.choices[0].message.content or ""
+    if resp:
+        text = resp.choices[0].message.content or ""
+        if text.strip():
+            return text.strip()
+
+    return "\n".join([
+        "- This record is unusual because its value is far from the dataset average.",
+        f"- Metric: **{anomaly['metric']}**, z-score: **{anomaly['z_score']:.2f}**.",
+        "- Likely causes: cutoff timing, provider batching, or data quality issues.",
+        "- Next checks: group by weekday/provider/status and inspect neighboring timestamps.",
+    ])

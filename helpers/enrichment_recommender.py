@@ -2,7 +2,7 @@ import json
 from typing import Any
 import pandas as pd
 
-from clients.openai_client import client
+from clients.openai_client import call_openai_with_retries, client
 
 
 CATALOG = [
@@ -57,15 +57,22 @@ Rules:
 - If requirements are missing (country/date), set recommend=false.
 """.strip()
 
-    try:
-        resp = await client.responses.create(
+    parsed = None
+    resp = await call_openai_with_retries(
+        lambda: client.responses.create(
             model="gpt-4.1-mini",
             input=[{"role": "user", "content": prompt}],
             max_output_tokens=180,
         )
-        raw = (resp.output_text or "").strip()
-        parsed = json.loads(raw)
-    except Exception:
+    )
+    if resp:
+        try:
+            raw = (resp.output_text or "").strip()
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = None
+
+    if parsed is None:
         parsed = {
             "recommend": False,
             "source_id": None,

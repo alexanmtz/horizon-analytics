@@ -2,13 +2,27 @@ import json
 import re
 import pandas as pd
 
-from clients.openai_client import client
+from clients.openai_client import call_openai_with_retries, client
 from metrics import add_derived_columns
 
 
 def should_use_llm_for_question(question: str, deterministic_answer: str) -> bool:
     q = (question or "").lower()
     generic = (deterministic_answer or "").strip().startswith("### 📌 Key metrics")
+
+    holiday_intent = any(
+        token in q
+        for token in [
+            "holiday",
+            "christmas",
+            "xmas",
+            "easter",
+            "good friday",
+            "pentecost",
+            "new year",
+            "bank holiday",
+        ]
+    )
 
     complex_intent = any(
         token in q
@@ -31,7 +45,11 @@ def should_use_llm_for_question(question: str, deterministic_answer: str) -> boo
         ]
     )
 
-    return generic or complex_intent
+    named_event_count_intent = bool(
+        re.search(r"\b(how many|count|number of)\b.*\bon\b\s+[a-z]", q)
+    )
+
+    return generic or complex_intent or holiday_intent or named_event_count_intent
 
 
 async def ai_answer_question(
@@ -71,9 +89,13 @@ Rules:
         "max_output_tokens": 320,
         "timeout": timeout_seconds,
     }
-    resp = await client.responses.create(**req)
-    text = (resp.output_text or "").strip()
-    return text or deterministic_answer
+    resp = await call_openai_with_retries(lambda: client.responses.create(**req))
+    if resp:
+        text = (resp.output_text or "").strip()
+        if text:
+            return text
+
+    return deterministic_answer
 
 
 def _build_context(derived: pd.DataFrame, mapping: dict, question: str) -> dict:
@@ -142,7 +164,53 @@ def _build_context(derived: pd.DataFrame, mapping: dict, question: str) -> dict:
                     )
                     context["segment_insights"]["sunday_corr_n"] = int(sunday_rows.shape[0])
 
+    if "holiday_name" in derived.columns:
+        holiday_series = derived["holiday_name"].fillna("").astype(str).str.strip()
+        valid_mask = holiday_series.ne("") & ~holiday_series.str.lower().isin(["nan", "none", "nat"])
+
+        if valid_mask.any():
+            holiday_counts = (
+                holiday_series.loc[valid_mask]
+                .value_counts()
+                .head(30)
+                .rename_axis("holiday_name")
+                .reset_index(name="count")
+            )
+            context["segment_insights"]["holiday_name_counts"] = holiday_counts.to_dict(orient="records")
+
+            holiday_name_norm = holiday_series.apply(
+                lambda v: re.sub(r"[^a-z0-9]+", " ", str(v).lower()).strip()
+            )
+            q_norm = re.sub(r"[^a-z0-9]+", " ", q).strip()
+            matched_holiday_norms = [
+                name
+                for name in holiday_name_norm.loc[valid_mask].dropna().unique().tolist()
+                if name and f" {name} " in f" {q_norm} "
+            ]
+
+            if matched_holiday_norms:
+                matched_mask = holiday_name_norm.isin(matched_holiday_norms)
+                matched_count = int(matched_mask.sum())
+                context["segment_insights"]["question_matched_holiday_rows"] = matched_count
+
+                matched_names = sorted(holiday_series.loc[matched_mask].dropna().astype(str).unique().tolist())
+                context["segment_insights"]["question_matched_holidays"] = matched_names[:10]
+
+                if "delay_hours" in derived.columns:
+                    matched_delay = pd.to_numeric(derived.loc[matched_mask, "delay_hours"], errors="coerce").dropna()
+                    if not matched_delay.empty:
+                        context["segment_insights"]["question_matched_holiday_delay"] = {
+                            "mean": round(float(matched_delay.mean()), 4),
+                            "median": round(float(matched_delay.median()), 4),
+                            "count": int(matched_delay.shape[0]),
+                        }
+
     preview_cols = [c for c in [mapping.get("id"), amount_col, "delay_hours", "arrival_weekday", mapping.get("status")] if c and c in derived.columns]
+    if "holiday_name" in derived.columns:
+        preview_cols.append("holiday_name")
+    if "is_bank_holiday" in derived.columns:
+        preview_cols.append("is_bank_holiday")
+    preview_cols = list(dict.fromkeys(preview_cols))
     if preview_cols:
         context["sample_rows"] = derived[preview_cols].head(20).to_dict(orient="records")
 

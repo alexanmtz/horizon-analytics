@@ -160,6 +160,10 @@ def answer_question(df, mapping, question: str) -> str:
 
         return _append_scope_note("\n".join(findings), scope_note)
 
+    named_holiday_answer = _answer_named_holiday_question(scoped, q)
+    if named_holiday_answer:
+        return _append_scope_note(named_holiday_answer, scope_note)
+
     count_answer = _answer_count_question(scoped, mapping, q)
     if count_answer:
         return _append_scope_note(count_answer, scope_note)
@@ -186,6 +190,61 @@ def answer_question(df, mapping, question: str) -> str:
 
     # Fallback
     return _append_scope_note(compute_all_metrics(scoped, mapping), scope_note)
+
+
+def _normalize_text_for_match(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+
+def _answer_named_holiday_question(derived: pd.DataFrame, q: str) -> str | None:
+    if "holiday_name" not in derived.columns:
+        return None
+
+    holiday_series_all = derived["holiday_name"].fillna("").astype(str).str.strip()
+    valid_mask = holiday_series_all.ne("") & ~holiday_series_all.str.lower().isin(["nan", "none", "nat"])
+    holiday_series = holiday_series_all.loc[valid_mask]
+    if holiday_series.empty:
+        return None
+
+    q_norm = _normalize_text_for_match(q)
+    names = sorted(holiday_series.unique().tolist(), key=len, reverse=True)
+
+    matched_name = None
+    matched_name_norm = None
+    q_padded = f" {q_norm} "
+    for name in names:
+        name_norm = _normalize_text_for_match(name)
+        if not name_norm:
+            continue
+        if f" {name_norm} " in q_padded:
+            matched_name = name
+            matched_name_norm = name_norm
+            break
+
+    if not matched_name or not matched_name_norm:
+        return None
+
+    normalized_holidays = holiday_series_all.apply(_normalize_text_for_match)
+    matched_rows = derived.loc[normalized_holidays == matched_name_norm].copy()
+
+    is_count_intent = any(token in q for token in ["how many", "count", "total", "number of", "payout", "payouts"])
+    is_delay_avg_intent = any(token in q for token in ["average", "avg", "mean"]) and any(
+        token in q for token in ["delay", "late"]
+    )
+
+    if is_delay_avg_intent and "delay_hours" in matched_rows.columns:
+        delay_values = pd.to_numeric(matched_rows["delay_hours"], errors="coerce").dropna()
+        if delay_values.empty:
+            return f"No valid delay values found for **{matched_name}** in the current dataset."
+        return (
+            f"Average delay on **{matched_name}**: **{delay_values.mean():.2f}h** "
+            f"(rows: **{int(delay_values.shape[0])}**)."
+        )
+
+    if is_count_intent or " on " in q:
+        return f"Payouts on **{matched_name}**: **{int(len(matched_rows))}**"
+
+    return None
 
 
 def _answer_grouped_aggregate_question(derived: pd.DataFrame, mapping: dict, q: str) -> str | None:

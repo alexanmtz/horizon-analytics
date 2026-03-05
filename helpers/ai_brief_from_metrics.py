@@ -1,5 +1,6 @@
 import pandas as pd
-from clients.openai_client import client
+
+from clients.openai_client import call_openai_with_retries, client
 
 async def ai_brief_from_metrics(
     df: pd.DataFrame,
@@ -36,5 +37,14 @@ Keep it concise and generic. Do not assume delay-related columns exist.
     if timeout_seconds is not None:
         req["timeout"] = timeout_seconds
 
-    resp = await client.responses.create(**req)
-    return resp.output_text or ""
+    resp = await call_openai_with_retries(lambda: client.responses.create(**req))
+    if resp:
+        text = (resp.output_text or "").strip()
+        if text:
+            return text
+
+    return "\n".join([
+        "- Initial metrics were generated successfully.",
+        "- AI summary is temporarily unavailable due to model service instability.",
+        "- Ask a specific question to continue analysis from computed metrics.",
+    ])
