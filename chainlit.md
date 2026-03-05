@@ -92,9 +92,22 @@ Main components:
 
 ## What I Would Build Next
 
+### More use cases and improve codebase
+
+I narrowed down the system to show the core on really specific use cases cases.
+So I would consider
+
+- Similar use cases
+- Improve mapping system for better insights
+
+This would turn Horizon into a **proactive analytics assistant**.
+
+---
+
 ### Autonomous Hypothesis Generation
 
-Currently, insights are driven by user questions. The next step would be for the system to proactively generate hypotheses such as:
+Currently, insights are driven by user questions. 
+The next step would be for the system to proactively generate hypotheses such as:
 
 - country-level anomalies  
 - seasonality patterns  
