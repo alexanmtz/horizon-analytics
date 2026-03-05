@@ -21,6 +21,41 @@ from helpers.enrichment_recommender import recommend_enrichment
 load_dotenv()
 
 
+CORE_MAPPING_KEYS = [
+    "id",
+    "status",
+    "amount",
+    "currency",
+    "created_at",
+    "paid_at",
+    "expected_arrival_at",
+    "arrival_at",
+]
+
+
+def _mapping_summary_markdown(mapping: dict | None, max_items: int = 20) -> str:
+    mapping = mapping or {}
+
+    ordered_keys = [k for k in CORE_MAPPING_KEYS if k in mapping]
+    ordered_keys.extend(sorted([k for k in mapping.keys() if k not in CORE_MAPPING_KEYS]))
+
+    if not ordered_keys:
+        return "- _(no mapping inferred)_"
+
+    visible_keys = ordered_keys[:max_items]
+    lines = []
+    for key in visible_keys:
+        value = mapping.get(key)
+        value_text = str(value) if value else "_(not mapped)_"
+        lines.append(f"- {key}: `{value_text}`")
+
+    remaining = len(ordered_keys) - len(visible_keys)
+    if remaining > 0:
+        lines.append(f"- ... and {remaining} more mapped fields")
+
+    return "\n".join(lines)
+
+
 def _to_preview_markdown(df, max_rows: int = 8, max_cols: int = 10) -> str:
     preview = df.head(max_rows)
     cols = list(preview.columns)[:max_cols]
@@ -73,6 +108,9 @@ def _fallback_openholidays_suggestion(df, mapping: dict) -> dict | None:
 
 
 async def _suggest_enrichment_if_relevant(df, mapping: dict, question: str, response: str) -> None:
+    if not cl.user_session.get("mapping_ready", False):
+        return
+
     connected_sources = set(cl.user_session.get("connected_datasources") or [])
 
     suggestion = await recommend_enrichment(df, mapping, question or "", response or "")
@@ -108,6 +146,8 @@ async def on_chat_start():
     cl.user_session.set("mapping", {})
     cl.user_session.set("holidays_connected", False)
     cl.user_session.set("connected_datasources", [])
+    cl.user_session.set("mapping_ready", False)
+    cl.user_session.set("pending_mapping_target", None)
     await cl.Message(
         content=(
             "Upload a CSV/XLSX to begin or paste the data here. \n"
@@ -137,6 +177,8 @@ async def on_message(msg: cl.Message):
             cl.user_session.set("df_enriched", None)
             cl.user_session.set("holidays_connected", False)
             cl.user_session.set("connected_datasources", [])
+            cl.user_session.set("mapping_ready", False)
+            cl.user_session.set("pending_mapping_target", None)
 
             step.output = "Inferring semantic column mapping..."
             mapping = await asyncio.to_thread(suggest_mapping, df)
@@ -168,6 +210,8 @@ async def on_message(msg: cl.Message):
             cl.user_session.set("df_enriched", None)
             cl.user_session.set("holidays_connected", False)
             cl.user_session.set("connected_datasources", [])
+            cl.user_session.set("mapping_ready", False)
+            cl.user_session.set("pending_mapping_target", None)
 
             step.output = "Inferring semantic column mapping..."
             mapping = await asyncio.to_thread(suggest_mapping, df)
@@ -180,6 +224,7 @@ async def on_message(msg: cl.Message):
     if loaded_df is not None:
         sanitized_mapping, mapping_warnings = validate_temporal_mapping(loaded_df, loaded_mapping or {})
         cl.user_session.set("mapping", sanitized_mapping)
+        data_preview_md = _to_preview_markdown(loaded_df, 8, 10)
 
         warning_text = ""
         if mapping_warnings:
@@ -191,28 +236,14 @@ async def on_message(msg: cl.Message):
         await cl.Message(
             content=(
                 f"Loaded {len(loaded_df)} rows.\n\n"
-                "Suggested mapping:\n"
-                f"- paid_at: `{(sanitized_mapping or {}).get('paid_at')}`\n"
-                f"- arrival_at: `{(sanitized_mapping or {}).get('arrival_at')}`\n"
-                f"- expected_arrival_at: `{(sanitized_mapping or {}).get('expected_arrival_at')}`\n\n"
-                "Use the button below to apply a mapping override."
+                "### Data Preview\n\n"
+                f"{data_preview_md}\n\n"
+                "Ask questions about this data, generate insights, or suggest enrichment."
                 f"{warning_text}"
             ),
             actions=[
-                cl.Action(
-                    name="apply_mapping_override",
-                    payload={
-                        "command": (
-                            "map "
-                            f"paid_at={(sanitized_mapping or {}).get('paid_at') or ''} "
-                            f"arrival_at={(sanitized_mapping or {}).get('arrival_at') or ''} "
-                            f"expected_arrival_at={(sanitized_mapping or {}).get('expected_arrival_at') or ''}"
-                        ).strip()
-                    },
-                    label="Override Mapping",
-                    icon="wrench",
-                ),
-                cl.Action(name="skip_mapping", payload={"action": "skip"}, label="Skip", icon="skip-forward"),
+                cl.Action(name="generate_insights", payload={"action": "generate_insights"}, label="Generate Insights", icon="sparkles"),
+                cl.Action(name="suggest_enrichment", payload={"reason": "post_upload"}, label="Suggest Enrichment", icon="plug"),
                 cl.Action(name="show_profile", payload={"action": "profile"}, label="View Profile", icon="bar-chart-3"),
             ],
         ).send()
@@ -232,9 +263,7 @@ async def on_message(msg: cl.Message):
         await cl.Message(
             content=(
                 "Mapping updated.\n"
-                f"- paid_at: `{new_mapping.get('paid_at')}`\n"
-                f"- arrival_at: `{new_mapping.get('arrival_at')}`\n"
-                f"- expected_arrival_at: `{new_mapping.get('expected_arrival_at')}`\n\n"
+                f"{_mapping_summary_markdown(new_mapping)}\n\n"
                 "Now click Confirm."
             ),
             actions=[
@@ -347,17 +376,23 @@ async def apply_mapping_override_action(action: cl.Action):
     if mapping_warnings:
         warning_text = "\n\nTemporal mapping guard:\n" + "\n".join([f"- {w}" for w in mapping_warnings])
 
+    pending_mapping_target = cl.user_session.get("pending_mapping_target")
+    if pending_mapping_target == "insights":
+        confirm_action_name = "confirm_mapping_for_insights"
+    elif pending_mapping_target == "enrichment":
+        confirm_action_name = "confirm_mapping_for_enrichment"
+    else:
+        confirm_action_name = "confirm_mapping"
+
     await cl.Message(
         content=(
             "Mapping updated.\n"
-            f"- paid_at: `{sanitized_mapping.get('paid_at')}`\n"
-            f"- arrival_at: `{sanitized_mapping.get('arrival_at')}`\n"
-            f"- expected_arrival_at: `{sanitized_mapping.get('expected_arrival_at')}`\n\n"
+            f"{_mapping_summary_markdown(sanitized_mapping)}\n\n"
             "Now click Confirm."
             f"{warning_text}"
         ),
         actions=[
-            cl.Action(name="confirm_mapping", payload={"action": "confirm"}, label="Confirm", icon="check"),
+            cl.Action(name=confirm_action_name, payload={"action": "confirm"}, label="Confirm", icon="check"),
         ],
     ).send()
 
@@ -447,6 +482,42 @@ async def generate_insights(action: cl.Action):
         await cl.Message(content="No dataset loaded.").send()
         return
 
+    if not cl.user_session.get("mapping_ready", False):
+        sanitized_mapping, mapping_warnings = validate_temporal_mapping(df, mapping)
+        cl.user_session.set("mapping", sanitized_mapping)
+        cl.user_session.set("pending_mapping_target", "insights")
+
+        warning_text = ""
+        if mapping_warnings:
+            warning_text = "\n\nTemporal mapping guard:\n" + "\n".join([f"- {w}" for w in mapping_warnings])
+
+        await cl.Message(
+            content=(
+                "Before generating insights, confirm the temporal mapping.\n\n"
+                "Suggested mapping:\n"
+                f"{_mapping_summary_markdown(sanitized_mapping)}\n\n"
+                "You can override mapping if needed, then confirm."
+                f"{warning_text}"
+            ),
+            actions=[
+                cl.Action(
+                    name="apply_mapping_override",
+                    payload={
+                        "command": (
+                            "map "
+                            f"paid_at={(sanitized_mapping or {}).get('paid_at') or ''} "
+                            f"arrival_at={(sanitized_mapping or {}).get('arrival_at') or ''} "
+                            f"expected_arrival_at={(sanitized_mapping or {}).get('expected_arrival_at') or ''}"
+                        ).strip()
+                    },
+                    label="Override Mapping",
+                    icon="wrench",
+                ),
+                cl.Action(name="skip_mapping_for_insights", payload={"action": "skip"}, label="Skip", icon="skip-forward"),
+            ],
+        ).send()
+        return
+
     if not metrics_text:
         metrics_text = await asyncio.to_thread(compute_all_metrics, df, mapping)
         cl.user_session.set("latest_metrics_text", metrics_text)
@@ -496,6 +567,42 @@ async def suggest_enrichment_action(action: cl.Action):
         await cl.Message(content="No dataset loaded.").send()
         return
 
+    if not cl.user_session.get("mapping_ready", False):
+        sanitized_mapping, mapping_warnings = validate_temporal_mapping(df, mapping)
+        cl.user_session.set("mapping", sanitized_mapping)
+        cl.user_session.set("pending_mapping_target", "enrichment")
+
+        warning_text = ""
+        if mapping_warnings:
+            warning_text = "\n\nTemporal mapping guard:\n" + "\n".join([f"- {w}" for w in mapping_warnings])
+
+        await cl.Message(
+            content=(
+                "Before suggesting enrichment, confirm the temporal mapping.\n\n"
+                "Suggested mapping:\n"
+                f"{_mapping_summary_markdown(sanitized_mapping)}\n\n"
+                "You can override mapping if needed, then confirm."
+                f"{warning_text}"
+            ),
+            actions=[
+                cl.Action(
+                    name="apply_mapping_override",
+                    payload={
+                        "command": (
+                            "map "
+                            f"paid_at={(sanitized_mapping or {}).get('paid_at') or ''} "
+                            f"arrival_at={(sanitized_mapping or {}).get('arrival_at') or ''} "
+                            f"expected_arrival_at={(sanitized_mapping or {}).get('expected_arrival_at') or ''}"
+                        ).strip()
+                    },
+                    label="Override Mapping",
+                    icon="wrench",
+                ),
+                cl.Action(name="skip_mapping_for_enrichment", payload={"action": "skip"}, label="Skip", icon="skip-forward"),
+            ],
+        ).send()
+        return
+
     connected_sources = set(cl.user_session.get("connected_datasources") or [])
     suggestion = await recommend_enrichment(df, mapping, "explain delays", "internal explanation requested")
     if not suggestion:
@@ -522,6 +629,38 @@ async def suggest_enrichment_action(action: cl.Action):
             )
         ],
     ).send()
+
+
+@cl.action_callback("confirm_mapping_for_enrichment")
+async def confirm_mapping_for_enrichment(action: cl.Action):
+    cl.user_session.set("mapping_ready", True)
+    cl.user_session.set("pending_mapping_target", None)
+    await cl.Message(content="Mapping confirmed for enrichment suggestions.").send()
+    await suggest_enrichment_action(cl.Action(name="suggest_enrichment", payload={"reason": "mapping_confirmed"}, label="Suggest Enrichment"))
+
+
+@cl.action_callback("skip_mapping_for_enrichment")
+async def skip_mapping_for_enrichment(action: cl.Action):
+    cl.user_session.set("mapping_ready", True)
+    cl.user_session.set("pending_mapping_target", None)
+    await cl.Message(content="Proceeding with current mapping for enrichment suggestions.").send()
+    await suggest_enrichment_action(cl.Action(name="suggest_enrichment", payload={"reason": "mapping_skipped"}, label="Suggest Enrichment"))
+
+
+@cl.action_callback("confirm_mapping_for_insights")
+async def confirm_mapping_for_insights(action: cl.Action):
+    cl.user_session.set("mapping_ready", True)
+    cl.user_session.set("pending_mapping_target", None)
+    await cl.Message(content="Mapping confirmed for insights.").send()
+    await generate_insights(cl.Action(name="generate_insights", payload={"reason": "mapping_confirmed"}, label="Generate Insights"))
+
+
+@cl.action_callback("skip_mapping_for_insights")
+async def skip_mapping_for_insights(action: cl.Action):
+    cl.user_session.set("mapping_ready", True)
+    cl.user_session.set("pending_mapping_target", None)
+    await cl.Message(content="Proceeding with current mapping for insights.").send()
+    await generate_insights(cl.Action(name="generate_insights", payload={"reason": "mapping_skipped"}, label="Generate Insights"))
 
 
 @cl.action_callback("connect_datasource")

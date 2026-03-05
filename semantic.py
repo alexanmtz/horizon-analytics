@@ -13,6 +13,8 @@ DEFAULT_KEYS = [
     "arrival_at",
 ]
 
+CORE_TEMPORAL_KEYS = ["arrival_at", "expected_arrival_at", "paid_at", "created_at"]
+
 def suggest_mapping(df: pd.DataFrame) -> dict:
     cols = list(df.columns)
     mapping = {k: None for k in DEFAULT_KEYS}
@@ -40,7 +42,37 @@ def suggest_mapping(df: pd.DataFrame) -> dict:
         used_cols.add(col)
 
     _fill_temporal_fallbacks(df, mapping)
+    _attach_dynamic_column_keys(df, mapping)
     return mapping
+
+
+def _attach_dynamic_column_keys(df: pd.DataFrame, mapping: dict) -> None:
+    """
+    Attach dynamic keys for unmapped columns using normalized column names.
+    Example: "Customer Country" -> mapping["customer_country"] = "Customer Country"
+    """
+    if df is None or df.empty:
+        return
+
+    used_cols = {v for v in mapping.values() if isinstance(v, str) and v}
+
+    for col in df.columns:
+        col_name = str(col)
+        if col_name in used_cols:
+            continue
+
+        dynamic_key = _normalize_column_ref(col_name)
+        if not dynamic_key:
+            continue
+
+        if dynamic_key in DEFAULT_KEYS:
+            continue
+
+        current = mapping.get(dynamic_key)
+        if current and current != col_name:
+            continue
+
+        mapping[dynamic_key] = col_name
 
 
 def guess_datetime_cols(df: pd.DataFrame) -> list[str]:
@@ -153,7 +185,7 @@ def _behavior_score(key: str, p: dict) -> float:
 
 
 def _fill_temporal_fallbacks(df: pd.DataFrame, mapping: dict) -> None:
-    temporal_keys = ["arrival_at", "expected_arrival_at", "paid_at", "created_at"]
+    temporal_keys = CORE_TEMPORAL_KEYS
     unresolved = [k for k in temporal_keys if not mapping.get(k)]
     if not unresolved:
         return
@@ -210,7 +242,7 @@ def validate_temporal_mapping(df: pd.DataFrame, mapping: dict, min_parse_ratio: 
     warnings: list[str] = []
     missing_keys: dict[str, str] = {}
 
-    temporal_keys = ["arrival_at", "expected_arrival_at", "paid_at", "created_at"]
+    temporal_keys = CORE_TEMPORAL_KEYS
     for k in temporal_keys:
         updated.setdefault(k, None)
 
