@@ -24,9 +24,9 @@ This led to the concept of **Horizon** — an AI-first analytics assistant desig
 ## Workflow
 
 A small **demo dataset is included in the repository** to illustrate the workflow:
-
 https://github.com/alexanmtz/horizon-analytics/tree/main/sample_data
 
+You can copy and paste or download and upload the data on the system.
 
 1. The user uploads a dataset (e.g., a payouts table).
 2. Horizon generates a structural overview of the data.
@@ -40,9 +40,9 @@ https://github.com/alexanmtz/horizon-analytics/tree/main/sample_data
    - **bank holidays**
 6. The system suggests enriching the dataset by connecting to an external source (e.g., a public holidays API).
 
-The key idea is that insights emerge through **iterative reasoning**, not through predefined dashboards.
+The key idea is that insights can connect to external resources that can give additional insights.
 
-> **Note:** The current implementation is a **working prototype / demo** intended to demonstrate the AI-driven analytical workflow. Some capabilities (automatic data discovery, richer integrations, and deeper reasoning chains) are intentionally simplified or limited.
+> **Note:** The current implementation is a **working prototype / demo** intended to demonstrate the AI-driven analytical workflow. Most of the functionalities are limited and it's a proof of concept with minimal use cases.
 
 ---
 
@@ -59,22 +59,18 @@ The AI handles:
 - hypothesis generation
 - suggesting next analytical steps
 
-The UI exists mainly to support the reasoning process, rather than replacing it with dashboards.
-
 ---
 
 ### Context Expansion
 
-A core principle behind Horizon is that **data rarely explains itself**.
-
-The system allows the AI to suggest and integrate contextual data sources such as:
+The system wants to allow the AI to suggest and integrate contextual data sources such as:
 
 - public holiday calendars  
 - economic indicators  
 - geography and time zones  
 - banking infrastructure  
 
-This transforms analytics from simple **data exploration** into **context discovery**.
+This transforms analytics from simple **data exploration** into **context discovery**, as apply the context to extend the data.
 
 ---
 
@@ -88,8 +84,6 @@ Main components:
 - **Python + Pandas** for data inspection and transformation
 - **OpenAI models** for reasoning and hypothesis generation
 - **External APIs** (e.g., holiday datasets) for contextual enrichment
-
-This setup makes it easy to iterate on the core idea of **AI-guided analytics exploration**.
 
 ---
 
@@ -131,15 +125,3 @@ Using MCP would allow Horizon to dynamically access external tools and data sour
 - knowledge bases  
 
 This would enable a more agentic architecture where the AI can discover and use new capabilities without requiring hardcoded integrations.
-
----
-
-## Final Thought
-
-Most analytics tools focus on querying data.
-
-Horizon explores a different direction:
-
-**What if analytics helped users discover the context their data is missing?**
-
-By combining conversational AI, contextual enrichment, and agent-driven exploration, Horizon moves analytics **beyond the limits of the dataset itself.**
