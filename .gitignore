@@ -37,9 +37,12 @@ htmlcov/
 *.db
 
 # Chainlit runtime artifacts
+.chainlit/*
+!.chainlit/config.toml
+!.chainlit/translations/
+!.chainlit/translations/*.json
 .chainlit/cache/
 .chainlit/tmp/
-.chainlit/
 
 # OS files
 .DS_Store
