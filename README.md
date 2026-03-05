@@ -10,4 +10,4 @@ Sample datasets: https://github.com/alexanmtz/horizon-analytics/tree/main/sample
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python chainlit run app.py -w
+python -m chainlit run app.py -w
