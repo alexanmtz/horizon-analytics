@@ -1,4 +1,6 @@
-# Horizon — AI-First Analytics Beyond the Data Horizon
+# Horizon
+
+AI Analytics Beyond the Data Horizon
 
 ## Problem
 
