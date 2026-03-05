@@ -542,7 +542,7 @@ async def confirm_mapping(action: cl.Action):
 
 @cl.action_callback("skip_mapping")
 async def skip_mapping(action: cl.Action):
-    await cl.Message(content="Keeping the data as is (no mapping override applied).", author="Assistant").send()
+    await cl.Message(content="Keeping the data as is (no mapping override applied).", author="Horizon Analytics").send()
 
     await _prepare_data_preview(
         step_name="Skip mapping override",
