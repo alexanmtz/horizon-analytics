@@ -47,6 +47,8 @@ def guess_datetime_cols(df: pd.DataFrame) -> list[str]:
     ok = []
     for c in df.columns:
         try:
+            if not _is_temporal_candidate(df[c], c):
+                continue
             parsed = pd.to_datetime(df[c], errors="coerce", utc=True)
             if parsed.notna().mean() > 0.6:  # 60% parseable
                 ok.append(c)
@@ -65,8 +67,11 @@ def _column_profile(df: pd.DataFrame, col: str) -> dict:
     numeric = pd.to_numeric(s, errors="coerce")
     numeric_ratio = float(numeric.notna().mean())
 
-    dt = pd.to_datetime(s, errors="coerce", utc=True)
-    datetime_ratio = float(dt.notna().mean())
+    if _is_temporal_candidate(s, col):
+        dt = pd.to_datetime(s, errors="coerce", utc=True)
+        datetime_ratio = float(dt.notna().mean())
+    else:
+        datetime_ratio = 0.0
 
     str_s = s.dropna().astype(str)
     avg_len = float(str_s.str.len().mean()) if len(str_s) > 0 else 0.0
@@ -80,6 +85,30 @@ def _column_profile(df: pd.DataFrame, col: str) -> dict:
         "avg_len": avg_len,
         "alpha_ratio": alpha_ratio,
     }
+
+
+def _is_temporal_candidate(series: pd.Series, col: str) -> bool:
+    name = str(col).lower()
+    temporal_name_hints = ["date", "time", "timestamp", "datetime", "_at", "arrival", "paid", "created", "expected"]
+
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return True
+
+    if pd.api.types.is_numeric_dtype(series):
+        return any(hint in name for hint in temporal_name_hints)
+
+    # For object/string-like columns, require either temporal naming hints
+    # or timestamp-like characters in a meaningful portion of the values.
+    if any(hint in name for hint in temporal_name_hints):
+        return True
+
+    non_null = series.dropna().astype(str)
+    if non_null.empty:
+        return False
+
+    sample = non_null.head(200)
+    ts_like_ratio = sample.str.contains(r"[-/:T ]", regex=True, na=False).mean()
+    return float(ts_like_ratio) > 0.4
 
 
 def _name_similarity_score(key: str, col: str) -> float:
@@ -124,7 +153,7 @@ def _behavior_score(key: str, p: dict) -> float:
 
 
 def _fill_temporal_fallbacks(df: pd.DataFrame, mapping: dict) -> None:
-    temporal_keys = ["created_at", "paid_at", "expected_arrival_at", "arrival_at"]
+    temporal_keys = ["arrival_at", "expected_arrival_at", "paid_at", "created_at"]
     unresolved = [k for k in temporal_keys if not mapping.get(k)]
     if not unresolved:
         return
@@ -166,7 +195,201 @@ def apply_mapping_override(current: dict, command: str) -> dict:
             continue
         k, v = p.split("=", 1)
         k = k.strip()
-        v = v.strip()
+        v = v.strip().strip("`\"'")
         updated[k] = v
 
     return updated
+
+
+def validate_temporal_mapping(df: pd.DataFrame, mapping: dict, min_parse_ratio: float = 0.6) -> tuple[dict, list[str]]:
+    """
+    Validates temporal keys and auto-repairs invalid mappings using best datetime candidates.
+    Returns (updated_mapping, warnings).
+    """
+    updated = dict(mapping or {})
+    warnings: list[str] = []
+    missing_keys: dict[str, str] = {}
+
+    temporal_keys = ["arrival_at", "expected_arrival_at", "paid_at", "created_at"]
+    for k in temporal_keys:
+        updated.setdefault(k, None)
+
+    # Validate assigned columns first.
+    used_by_temporal = {
+        col for key, col in updated.items()
+        if key in temporal_keys and isinstance(col, str) and col in df.columns
+    }
+
+    for key in temporal_keys:
+        col = updated.get(key)
+        if not col:
+            continue
+        original_col = col
+        resolved_col = _resolve_column_name(df, col)
+        if not resolved_col:
+            missing_keys[key] = str(col)
+            used_by_temporal.discard(col)
+            updated[key] = None
+            continue
+
+        if resolved_col != col:
+            warnings.append(f"Normalized {key} mapping: {col} -> {resolved_col}.")
+            updated[key] = resolved_col
+        col = resolved_col
+        used_by_temporal.discard(original_col)
+        used_by_temporal.add(col)
+
+        ratio = _datetime_parse_ratio(df[col])
+        if not _is_temporal_candidate(df[col], col):
+            ratio = 0.0
+        if ratio < min_parse_ratio:
+            warnings.append(
+                f"{key} -> {col}: only {ratio:.0%} parseable datetimes (min {min_parse_ratio:.0%})."
+            )
+            used_by_temporal.discard(col)
+            updated[key] = None
+
+    # Repair unresolved temporal keys with best available datetime candidates.
+    for key in temporal_keys:
+        if updated.get(key):
+            continue
+
+        best_col = _pick_best_temporal_replacement(
+            df=df,
+            key=key,
+            excluded_cols=used_by_temporal,
+            min_parse_ratio=min_parse_ratio,
+        )
+        if best_col:
+            updated[key] = best_col
+            used_by_temporal.add(best_col)
+            warnings.append(f"Auto-mapped {key} -> {best_col}.")
+            if key in missing_keys:
+                missing_keys.pop(key, None)
+
+    for key, col in missing_keys.items():
+        warnings.append(f"{key} -> {col}: column not found.")
+
+    return updated, warnings
+
+
+def _resolve_column_name(df: pd.DataFrame, raw_col: str | None) -> str | None:
+    if raw_col is None:
+        return None
+
+    candidate = str(raw_col).strip().strip("`\"'")
+    if not candidate:
+        return None
+
+    cols = [str(c) for c in df.columns]
+
+    if candidate in cols:
+        return candidate
+
+    by_stripped = {c.strip(): c for c in cols}
+    if candidate in by_stripped:
+        return by_stripped[candidate]
+
+    lower_map = {c.strip().lower(): c for c in cols}
+    lower_candidate = candidate.lower()
+    if lower_candidate in lower_map:
+        return lower_map[lower_candidate]
+
+    norm_candidate = _normalize_column_ref(candidate)
+    norm_to_col: dict[str, str | None] = {}
+    for col in cols:
+        norm_col = _normalize_column_ref(col)
+        if norm_col not in norm_to_col:
+            norm_to_col[norm_col] = col
+        else:
+            norm_to_col[norm_col] = None
+
+    resolved = norm_to_col.get(norm_candidate)
+    if resolved:
+        return resolved
+
+    return None
+
+
+def _normalize_column_ref(name: str) -> str:
+    s = str(name).strip()
+    s = s.replace(" ", "_").replace("-", "_").replace("/", "_")
+    s = "".join(ch for ch in s if ch.isalnum() or ch == "_")
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s.lower()
+
+
+def _datetime_parse_ratio(series: pd.Series) -> float:
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return float(series.notna().mean())
+
+    if pd.api.types.is_numeric_dtype(series):
+        return 0.0
+
+    parsed = pd.to_datetime(series, errors="coerce", utc=True)
+    return float(parsed.notna().mean())
+
+
+def _pick_best_temporal_replacement(
+    df: pd.DataFrame,
+    key: str,
+    excluded_cols: set[str],
+    min_parse_ratio: float,
+) -> str | None:
+    best_col = None
+    best_score = -1.0
+
+    for col in df.columns:
+        if col in excluded_cols:
+            continue
+
+        series = df[col]
+        if not _is_temporal_candidate(series, col):
+            continue
+
+        parse_ratio = _datetime_parse_ratio(series)
+        if parse_ratio < min_parse_ratio:
+            continue
+
+        name_score = _name_similarity_score(key, col)
+        affinity = _temporal_name_affinity(key, col)
+        score = (0.55 * name_score) + (0.20 * parse_ratio) + (0.25 * affinity)
+        if score > best_score:
+            best_score = score
+            best_col = col
+
+    return best_col
+
+
+def _temporal_name_affinity(key: str, col: str) -> float:
+    name = str(col).lower()
+
+    def has_any(tokens: list[str]) -> bool:
+        return any(t in name for t in tokens)
+
+    if key == "arrival_at":
+        if has_any(["arriv", "arrival"]):
+            if has_any(["expect", "eta", "estimated"]):
+                return 0.2
+            return 1.0
+        return 0.0
+
+    if key == "expected_arrival_at":
+        if has_any(["expect", "eta", "estimated"]):
+            return 1.0
+        if has_any(["arriv", "arrival"]):
+            return 0.35
+        return 0.0
+
+    if key == "paid_at":
+        if has_any(["paid", "pay", "settl", "release"]):
+            return 1.0
+        return 0.0
+
+    if key == "created_at":
+        if has_any(["creat", "submitted", "initiated", "request"]):
+            return 1.0
+        return 0.0
+
+    return 0.0

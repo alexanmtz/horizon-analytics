@@ -1,5 +1,6 @@
 import re
 import pandas as pd
+import numpy as np
 from metrics import compute_all_metrics, add_derived_columns
 
 
@@ -495,10 +496,18 @@ def format_table(df: pd.DataFrame, cols: list[str], max_rows: int = 10) -> str:
 
     rows = []
     for _, r in view.iterrows():
-        row_values = ["" if pd.isna(r[c]) else str(r[c]) for c in view.columns]
+        row_values = [_format_cell(r[c]) for c in view.columns]
         rows.append("| " + " | ".join(row_values) + " |")
 
     return "\n".join([header, sep] + rows)
+
+
+def _format_cell(v) -> str:
+    if pd.isna(v):
+        return ""
+    if isinstance(v, (float, np.floating)):
+        return f"{float(v):.2f}"
+    return str(v)
 
 
 def _reason_discovery_summary(derived: pd.DataFrame, mapping: dict) -> str:

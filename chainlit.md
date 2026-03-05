@@ -1,36 +1,148 @@
-# Horizon Analytics
+# Horizon — AI-First Analytics Beyond the Data Horizon
 
-AI-first analytics for payout and operations datasets.
+## Problem
 
-## How to start
+Most analytics tools assume that the data already contains the answers. In practice, however, many analytical questions require **context that exists outside the dataset**.
 
-1. Upload a **CSV** or **XLSX** file, or paste tabular data (CSV/TSV with header).
-2. Review the suggested semantic mapping (`arrival_at`, `expected_arrival_at`).
-3. Confirm mapping to generate the initial metrics brief.
-4. Ask follow-up questions to investigate delays, anomalies, and drivers.
+For example, when analyzing payout delays, a table may contain timestamps, countries, and providers. It can reveal that some transfers take longer than others, but it cannot explain why. The underlying cause may be external factors such as:
 
-Sample datasets:
+- bank holidays  
+- regional banking systems  
+- settlement windows  
+- payment infrastructure differences  
+
+Traditional analytics platforms focus on querying internal data. When external context is required, users must manually discover, fetch, and integrate those sources themselves.
+
+I wanted to explore a different approach: **an analytics system that actively identifies missing context and suggests external knowledge sources during analysis.**
+
+This led to the concept of **Horizon** — an AI-first analytics assistant designed to help users move beyond the “data horizon”.
+
+---
+
+## Solution
+
+Horizon is a conversational analytics tool where the AI is responsible for driving the analytical workflow.
+
+Instead of starting with dashboards or predefined queries, the user uploads a dataset and begins exploring it through conversation.
+
+A small **demo dataset is included in the repository** to illustrate the workflow:
+
 https://github.com/alexanmtz/horizon-analytics/tree/main/sample_data
 
-## What you can ask
+Example workflow:
 
-- "What is the average delay and how is it trending?"
-- "Show the biggest anomalies and explain likely causes."
-- "Break down delays by transfer type and amount buckets."
-- "Which factors most influence late arrivals?"
-- "Show top delays with holiday names."
+1. The user uploads a dataset (e.g., a payouts table).
+2. Horizon generates a structural overview of the data.
+3. The user asks exploratory questions such as:
+   - “What is the average transfer time?”
+4. The AI detects anomalies or patterns:
+   - “Some payouts take significantly longer than others.”
+5. The AI proposes possible explanations:
+   - country differences  
+   - provider differences  
+   - **bank holidays**
+6. The system suggests enriching the dataset by connecting to an external source (e.g., a public holidays API).
 
-## Enrichment support
+The key idea is that insights emerge through **iterative reasoning**, not through predefined dashboards.
 
-The assistant can recommend and connect external enrichments (for example, holidays via OpenHolidays) when useful.
+> **Note:** The current implementation is a **working prototype / demo** intended to demonstrate the AI-driven analytical workflow. Some capabilities (automatic data discovery, richer integrations, and deeper reasoning chains) are intentionally simplified or limited.
 
-After enrichment, you can ask:
+---
 
-- "Explain holiday impact"
-- "Compare holiday vs non-holiday delay"
+## Key Design Decisions
 
-## Tips
+### AI-First Interaction
 
-- Use clear date and business context in questions for better answers.
-- If the mapping looks wrong, use the **Override Mapping** action before confirming.
-- You can always continue exploring with suggested follow-up actions in the chat.
+Horizon is designed around a **conversation-driven analytical workflow**.
+
+The AI handles:
+
+- dataset interpretation
+- exploratory analysis
+- hypothesis generation
+- suggesting next analytical steps
+
+The UI exists mainly to support the reasoning process, rather than replacing it with dashboards.
+
+---
+
+### Context Expansion
+
+A core principle behind Horizon is that **data rarely explains itself**.
+
+The system allows the AI to suggest and integrate contextual data sources such as:
+
+- public holiday calendars  
+- economic indicators  
+- geography and time zones  
+- banking infrastructure  
+
+This transforms analytics from simple **data exploration** into **context discovery**.
+
+---
+
+### Lightweight Prototype Architecture
+
+The prototype focuses on validating the AI-driven workflow rather than building a full analytics stack.
+
+Main components:
+
+- **Chainlit** for conversational UI
+- **Python + Pandas** for data inspection and transformation
+- **OpenAI models** for reasoning and hypothesis generation
+- **External APIs** (e.g., holiday datasets) for contextual enrichment
+
+This setup makes it easy to iterate on the core idea of **AI-guided analytics exploration**.
+
+---
+
+## What I Would Build Next
+
+### Autonomous Hypothesis Generation
+
+Currently, insights are driven by user questions. The next step would be for the system to proactively generate hypotheses such as:
+
+- country-level anomalies  
+- seasonality patterns  
+- infrastructure-related delays  
+
+This would turn Horizon into a **proactive analytics assistant**.
+
+---
+
+### External Data Discovery
+
+Instead of manually integrating external APIs, Horizon could automatically discover and connect to relevant datasets such as:
+
+- public open-data portals  
+- economic indicators  
+- financial infrastructure datasets  
+
+This would allow the AI to continuously expand the analytical context.
+
+---
+
+### MCP-Based Tool Ecosystem
+
+A natural evolution of this system would be integrating **Model Context Protocol (MCP)**.
+
+Using MCP would allow Horizon to dynamically access external tools and data sources, such as:
+
+- public datasets  
+- APIs  
+- internal services  
+- knowledge bases  
+
+This would enable a more agentic architecture where the AI can discover and use new capabilities without requiring hardcoded integrations.
+
+---
+
+## Final Thought
+
+Most analytics tools focus on querying data.
+
+Horizon explores a different direction:
+
+**What if analytics helped users discover the context their data is missing?**
+
+By combining conversational AI, contextual enrichment, and agent-driven exploration, Horizon moves analytics **beyond the limits of the dataset itself.**

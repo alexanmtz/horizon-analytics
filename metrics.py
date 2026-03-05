@@ -12,7 +12,9 @@ def compute_all_metrics(df: pd.DataFrame, mapping: dict) -> str:
         tt = derived["transfer_time_hours"].dropna()
         lines.append(f"- Transfer time (hours): avg **{tt.mean():.2f}**, median **{tt.median():.2f}**, p90 **{np.percentile(tt, 90):.2f}**")
     else:
-        lines.append("- Transfer time: **could not be calculated** (`paid_at` and/or `arrival_at` is missing).")
+        lines.append(
+            "- Transfer time: **could not be calculated** (`paid_at` and/or `arrival_at` is missing, unmapped, or not parseable as datetime)."
+        )
 
     if "delay_hours" in derived.columns and derived["delay_hours"].notna().any():
         dh = derived["delay_hours"].dropna()
@@ -77,6 +79,8 @@ def format_table(df: pd.DataFrame, cols: list[str], max_rows: int = 10) -> str:
 
 
 def safe_cell(v) -> str:
-    if v is None or (isinstance(v, float) and np.isnan(v)):
+    if v is None or (isinstance(v, (float, np.floating)) and np.isnan(v)):
         return ""
+    if isinstance(v, (float, np.floating)):
+        return f"{float(v):.2f}"
     return str(v)

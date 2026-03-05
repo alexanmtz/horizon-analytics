@@ -8,10 +8,9 @@ from helpers.ai_brief_from_metrics import ai_brief_from_metrics
 from helpers.ai_followups import suggest_followups
 from helpers.ai_holiday_impact import ai_explain_holiday_impact
 from helpers.ai_qa import ai_answer_question, should_use_llm_for_question
-from helpers.anomaly import ai_explain_anomaly, detect_biggest_anomaly
 from ingest import load_table, load_table_from_text
 from profiling import profile_df
-from semantic import suggest_mapping, apply_mapping_override
+from semantic import suggest_mapping, apply_mapping_override, validate_temporal_mapping
 from metrics import compute_all_metrics
 from qa import answer_question
 
@@ -20,6 +19,86 @@ from helpers.ensure_derived import ensure_derived
 from helpers.enrichment_recommender import recommend_enrichment
 
 load_dotenv()
+
+
+def _to_preview_markdown(df, max_rows: int = 8, max_cols: int = 10) -> str:
+    preview = df.head(max_rows)
+    cols = list(preview.columns)[:max_cols]
+    preview = preview[cols] if cols else preview
+
+    if preview.empty:
+        return "| No data available |\n|---|"
+
+    headers = [str(col) for col in preview.columns]
+    header_row = "| " + " | ".join(headers) + " |"
+    separator_row = "| " + " | ".join(["---"] * len(headers)) + " |"
+
+    body_rows = []
+    for _, row in preview.iterrows():
+        values = []
+        for value in row.tolist():
+            if value is None:
+                values.append("")
+            else:
+                text = str(value).replace("\n", " ").replace("|", "\\|")
+                values.append(text)
+        body_rows.append("| " + " | ".join(values) + " |")
+
+    return "\n".join([header_row, separator_row, *body_rows])
+
+
+def _is_delay_explanation_question(question: str) -> bool:
+    q = (question or "").lower()
+    has_delay_topic = any(token in q for token in ["delay", "delays", "late", "lateness", "settlement", "arrival time", "transfer time"])
+    has_explain_intent = any(token in q for token in ["why", "explain", "reason", "driver", "drivers", "cause", "causes"])
+    return has_delay_topic and has_explain_intent
+
+
+def _fallback_openholidays_suggestion(df, mapping: dict) -> dict | None:
+    if df is None:
+        return None
+
+    if "country" not in df.columns:
+        return None
+
+    exp_col = (mapping or {}).get("expected_arrival_at")
+    if not exp_col or exp_col not in df.columns:
+        return None
+
+    return {
+        "source_id": "openholidays",
+        "reason": "Delay explanations may depend on holiday calendar effects that are not in the current dataset.",
+        "confidence": 0.78,
+    }
+
+
+async def _suggest_enrichment_if_relevant(df, mapping: dict, question: str, response: str) -> None:
+    connected_sources = set(cl.user_session.get("connected_datasources") or [])
+
+    suggestion = await recommend_enrichment(df, mapping, question or "", response or "")
+    if not suggestion and _is_delay_explanation_question(question or ""):
+        suggestion = _fallback_openholidays_suggestion(df, mapping)
+
+    if suggestion and suggestion.get("source_id") in connected_sources:
+        suggestion = None
+
+    if suggestion:
+        await cl.Message(
+            content=(
+                "I found a potentially useful external enrichment.\n\n"
+                f"- Source: `{suggestion['source_id']}`\n"
+                f"- Why: {suggestion['reason']}\n"
+                f"- Confidence: {suggestion['confidence']:.2f}"
+            ),
+            actions=[
+                cl.Action(
+                    name="connect_datasource",
+                    payload={"source_id": suggestion["source_id"]},
+                    label=f"Connect {suggestion['source_id']}",
+                    icon="plug",
+                )
+            ],
+        ).send()
 
 
 @cl.on_chat_start
@@ -99,18 +178,37 @@ async def on_message(msg: cl.Message):
         loaded_mapping = mapping
 
     if loaded_df is not None:
+        sanitized_mapping, mapping_warnings = validate_temporal_mapping(loaded_df, loaded_mapping or {})
+        cl.user_session.set("mapping", sanitized_mapping)
+
+        warning_text = ""
+        if mapping_warnings:
+            warning_text = (
+                "\n\nTemporal mapping guard:\n"
+                + "\n".join([f"- {w}" for w in mapping_warnings])
+            )
+
         await cl.Message(
             content=(
                 f"Loaded {len(loaded_df)} rows.\n\n"
                 "Suggested mapping:\n"
-                f"- arrival_at: `{(loaded_mapping or {}).get('arrival_at')}`\n"
-                f"- expected_arrival_at: `{(loaded_mapping or {}).get('expected_arrival_at')}`\n\n"
+                f"- paid_at: `{(sanitized_mapping or {}).get('paid_at')}`\n"
+                f"- arrival_at: `{(sanitized_mapping or {}).get('arrival_at')}`\n"
+                f"- expected_arrival_at: `{(sanitized_mapping or {}).get('expected_arrival_at')}`\n\n"
                 "Use the button below to apply a mapping override."
+                f"{warning_text}"
             ),
             actions=[
                 cl.Action(
                     name="apply_mapping_override",
-                    payload={"command": "map arrival_at=arrival_at"},
+                    payload={
+                        "command": (
+                            "map "
+                            f"paid_at={(sanitized_mapping or {}).get('paid_at') or ''} "
+                            f"arrival_at={(sanitized_mapping or {}).get('arrival_at') or ''} "
+                            f"expected_arrival_at={(sanitized_mapping or {}).get('expected_arrival_at') or ''}"
+                        ).strip()
+                    },
                     label="Override Mapping",
                     icon="wrench",
                 ),
@@ -134,6 +232,7 @@ async def on_message(msg: cl.Message):
         await cl.Message(
             content=(
                 "Mapping updated.\n"
+                f"- paid_at: `{new_mapping.get('paid_at')}`\n"
                 f"- arrival_at: `{new_mapping.get('arrival_at')}`\n"
                 f"- expected_arrival_at: `{new_mapping.get('expected_arrival_at')}`\n\n"
                 "Now click Confirm."
@@ -154,6 +253,10 @@ async def on_message(msg: cl.Message):
         return
 
     mapping = cl.user_session.get("mapping") or {}
+    sanitized_mapping, mapping_warnings = validate_temporal_mapping(df, mapping)
+    if sanitized_mapping != mapping:
+        cl.user_session.set("mapping", sanitized_mapping)
+    mapping = sanitized_mapping
     used_ai_deep_analysis = False
 
     async with cl.Step(name="Answer question") as step:
@@ -179,30 +282,12 @@ async def on_message(msg: cl.Message):
     final_response = response or "DEBUG: QA returned empty"
     if used_ai_deep_analysis:
         final_response = f"_AI deep analysis_\n\n{final_response}"
+    if mapping_warnings:
+        mapping_warning_text = "\n\n_Temporal mapping guard:_\n" + "\n".join([f"- {w}" for w in mapping_warnings])
+        final_response = f"{final_response}{mapping_warning_text}"
     await cl.Message(content=final_response).send()
 
-    connected_sources = set(cl.user_session.get("connected_datasources") or [])
-    suggestion = await recommend_enrichment(df, mapping, msg.content or "", response or "")
-    if suggestion and suggestion.get("source_id") in connected_sources:
-        suggestion = None
-
-    if suggestion:
-        await cl.Message(
-            content=(
-                "I found a potentially useful external enrichment.\n\n"
-                f"- Source: `{suggestion['source_id']}`\n"
-                f"- Why: {suggestion['reason']}\n"
-                f"- Confidence: {suggestion['confidence']:.2f}"
-            ),
-            actions=[
-                cl.Action(
-                    name="connect_datasource",
-                    payload={"source_id": suggestion["source_id"]},
-                    label=f"Connect {suggestion['source_id']}",
-                    icon="plug",
-                )
-            ],
-        ).send()
+    await _suggest_enrichment_if_relevant(df, mapping, msg.content or "", response or "")
 
     # Show clickable followups
     await cl.Message(
@@ -255,14 +340,21 @@ async def apply_mapping_override_action(action: cl.Action):
 
     mapping = cl.user_session.get("mapping") or {}
     new_mapping = apply_mapping_override(mapping, command)
-    cl.user_session.set("mapping", new_mapping)
+    sanitized_mapping, mapping_warnings = validate_temporal_mapping(df, new_mapping)
+    cl.user_session.set("mapping", sanitized_mapping)
+
+    warning_text = ""
+    if mapping_warnings:
+        warning_text = "\n\nTemporal mapping guard:\n" + "\n".join([f"- {w}" for w in mapping_warnings])
 
     await cl.Message(
         content=(
             "Mapping updated.\n"
-            f"- arrival_at: `{new_mapping.get('arrival_at')}`\n"
-            f"- expected_arrival_at: `{new_mapping.get('expected_arrival_at')}`\n\n"
+            f"- paid_at: `{sanitized_mapping.get('paid_at')}`\n"
+            f"- arrival_at: `{sanitized_mapping.get('arrival_at')}`\n"
+            f"- expected_arrival_at: `{sanitized_mapping.get('expected_arrival_at')}`\n\n"
             "Now click Confirm."
+            f"{warning_text}"
         ),
         actions=[
             cl.Action(name="confirm_mapping", payload={"action": "confirm"}, label="Confirm", icon="check"),
@@ -272,10 +364,9 @@ async def apply_mapping_override_action(action: cl.Action):
 
 @cl.action_callback("confirm_mapping")
 async def confirm_mapping(action: cl.Action):
-
-    await _generate_initial_insights(
+    await _prepare_data_preview(
         step_name="Confirm mapping",
-        completion_step_output="Mapping confirmed and insights ready.",
+        completion_step_output="Mapping confirmed and data preview ready.",
         summary_prefix="Mapping confirmed.",
     )
 
@@ -284,14 +375,14 @@ async def confirm_mapping(action: cl.Action):
 async def skip_mapping(action: cl.Action):
     await cl.Message(content="Keeping the data as is (no mapping override applied).", author="Assistant").send()
 
-    await _generate_initial_insights(
+    await _prepare_data_preview(
         step_name="Skip mapping override",
-        completion_step_output="Kept mapping as-is and prepared insights.",
+        completion_step_output="Kept mapping as-is and prepared data preview.",
         summary_prefix="Kept the data as is.",
     )
 
 
-async def _generate_initial_insights(
+async def _prepare_data_preview(
     step_name: str,
     completion_step_output: str,
     summary_prefix: str,
@@ -304,44 +395,90 @@ async def _generate_initial_insights(
         await cl.Message(content="No dataset loaded.").send()
         return
 
+    sanitized_mapping, mapping_warnings = validate_temporal_mapping(df, mapping)
+    if sanitized_mapping != mapping:
+        cl.user_session.set("mapping", sanitized_mapping)
+    mapping = sanitized_mapping
+
+    warning_text = ""
+    if mapping_warnings:
+        warning_text = (
+            "\n\n### Temporal mapping guard\n"
+            + "\n".join([f"- {w}" for w in mapping_warnings])
+        )
+
     async with cl.Step(name=step_name) as step:
         step.output = "Preparing derived columns..."
         derived = await asyncio.to_thread(ensure_derived, df, mapping)
         cl.user_session.set("df_enriched", derived)
 
-        step.output = "Computing metrics..."
-        metrics_text = await asyncio.to_thread(compute_all_metrics, derived, mapping)
+        step.output = "Preparing data preview..."
+        data_preview_md = await asyncio.to_thread(_to_preview_markdown, derived, 8, 10)
 
+        step.output = completion_step_output
+
+    preview_content = (
+        f"{summary_prefix}\n\n"
+        "### Data Preview\n\n"
+        f"{data_preview_md}\n\n"
+    )
+    if warning_text:
+        preview_content += f"{warning_text}\n\n"
+    preview_content += "Ask a question to explore drivers, or click below to generate the AI insight brief."
+
+    await cl.Message(
+        content=preview_content,
+        actions=[
+            cl.Action(name="generate_insights", payload={"action": "generate_insights"}, label="Generate Insights", icon="sparkles"),
+            cl.Action(name="suggest_enrichment", payload={"reason": "data_preview"}, label="Suggest Enrichment", icon="plug"),
+        ],
+    ).send()
+
+
+@cl.action_callback("generate_insights")
+async def generate_insights(action: cl.Action):
+    df = cl.user_session.get("df_enriched")
+    if df is None:
+        df = cl.user_session.get("df")
+    mapping = cl.user_session.get("mapping") or {}
+    metrics_text = cl.user_session.get("latest_metrics_text")
+
+    if df is None:
+        await cl.Message(content="No dataset loaded.").send()
+        return
+
+    if not metrics_text:
+        metrics_text = await asyncio.to_thread(compute_all_metrics, df, mapping)
+        cl.user_session.set("latest_metrics_text", metrics_text)
+
+    brief = ""
+    ai_task = None
+    async with cl.Step(name="Generate insight brief") as step:
         step.output = "Generating AI insight brief..."
-        brief = ""
-        ai_task = None
         try:
             ai_task = asyncio.create_task(
-                ai_brief_from_metrics(derived, mapping, metrics_text, timeout_seconds=15.0)
+                ai_brief_from_metrics(df, mapping, metrics_text, timeout_seconds=15.0)
             )
             done, _ = await asyncio.wait({ai_task}, timeout=20)
             if done:
                 brief = ai_task.result()
             else:
-                brief = "_(AI brief timed out — showing metrics only.)_"
+                brief = "_(AI brief timed out.)_"
                 ai_task.cancel()
         except Exception:
-            brief = "_(AI brief failed — showing metrics only.)_"
+            brief = "_(AI brief failed.)_"
             if ai_task and not ai_task.done():
                 ai_task.cancel()
             print("AI brief error:\n", traceback.format_exc())
-
-        step.output = completion_step_output
+        step.output = "Insight brief ready."
 
     await cl.Message(
         content=(
-            f"{summary_prefix}\n\n"
             "### Initial Insight Brief\n\n"
             f"{brief}\n\n"
-            f"{metrics_text}\n\n"
-            "Ask a question to explore drivers. If needed, I can suggest external enrichments."
+            "Ask a question to explore this data further."
         ),
-       actions=[
+        actions=[
             cl.Action(name="suggest_enrichment", payload={"reason": "initial_insights"}, label="Suggest Enrichment", icon="plug"),
         ],
     ).send()
@@ -456,46 +593,6 @@ async def connect_datasource_action(action: cl.Action):
     await cl.Message(content=f"Connected `{source_id}` and enriched your dataset.").send()
 
 
-@cl.action_callback("connect_holidays")
-async def connect_holidays_backward_compat(action: cl.Action):
-    action.payload = {"source_id": "openholidays"}
-    await connect_datasource_action(action)
-
-@cl.action_callback("explain_anomaly")
-async def explain_anomaly(action: cl.Action):
-    df = cl.user_session.get("df_enriched")
-    if df is None:
-        df = cl.user_session.get("df")
-
-    mapping = cl.user_session.get("mapping") or {}
-
-    if df is None:
-        await cl.Message(content="Upload a dataset first.").send()
-        return
-
-    async with cl.Step(name="Explain anomaly") as step:
-        step.output = "Detecting biggest anomaly..."
-        anomaly = await asyncio.to_thread(detect_biggest_anomaly, df, mapping)
-    if anomaly is None:
-        await cl.Message(content="I couldn't find an anomaly (missing delay/transfer columns).").send()
-        return
-
-    has_holidays = bool(cl.user_session.get("holidays_connected"))
-    async with cl.Step(name="Explain anomaly") as step:
-        step.output = "Generating AI explanation..."
-        explanation = await ai_explain_anomaly(anomaly, mapping, has_holidays=has_holidays)
-        step.output = "Anomaly explanation ready."
-
-    await cl.Message(
-        content=(
-            "### Biggest anomaly detected\n\n"
-            f"- Metric: **{anomaly['metric']}**\n"
-            f"- Z-score: **{anomaly['z_score']:.2f}**\n"
-            f"- Row: `{anomaly['row']}`\n\n"
-            f"{explanation}"
-        )
-    ).send()
-
 @cl.action_callback("ask_followup")
 async def ask_followup(action: cl.Action):
     q = (action.payload or {}).get("q")
@@ -505,6 +602,10 @@ async def ask_followup(action: cl.Action):
         df = cl.user_session.get("df")
 
     mapping = cl.user_session.get("mapping") or {}
+    sanitized_mapping, mapping_warnings = validate_temporal_mapping(df, mapping) if df is not None else (mapping, [])
+    if sanitized_mapping != mapping:
+        cl.user_session.set("mapping", sanitized_mapping)
+    mapping = sanitized_mapping
 
     q_norm = (q or "").strip().lower()
     used_ai_deep_analysis = False
@@ -545,7 +646,11 @@ async def ask_followup(action: cl.Action):
             )
         ]
 
-    followup_content = f"**Follow-up:** {q}\n\n{response}"
+    mapping_warning_text = ""
+    if mapping_warnings:
+        mapping_warning_text = "\n\n_Temporal mapping guard:_\n" + "\n".join([f"- {w}" for w in mapping_warnings])
+
+    followup_content = f"**Follow-up:** {q}\n\n{response}{mapping_warning_text}"
     if used_ai_deep_analysis:
         followup_content = f"_AI deep analysis_\n\n{followup_content}"
 
@@ -553,3 +658,5 @@ async def ask_followup(action: cl.Action):
         content=followup_content,
         actions=followup_actions,
     ).send()
+
+    await _suggest_enrichment_if_relevant(df, mapping, q or "", response or "")
